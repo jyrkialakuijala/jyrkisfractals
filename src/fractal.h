@@ -59,6 +59,12 @@ void samplePattern(int n, std::vector<float2>& out);
 // limit later is replaced by its color (replayPixel). A pixel is "black" when every sample it
 // has taken hit the limit.
 //
+// A sample's black only counts once it has been taken as deep as the pixel's other samples
+// were resolved to (depth[]): a later sample that ran out of per-pass budget, or hit a lower
+// limit than the pixel's earlier samples were probed under, is "pending": it keeps its hit
+// bit (so it is resumed every pass) but adds nothing to the sum or the weight until it has
+// caught up, so the pixel's color does not darken meanwhile. See docs/pending-samples.md.
+//
 // hitMask remembers which of the pixel's samples hit the limit. Once a pixel has all its
 // samples, every pass re-probes one of those samples at the current (deeper) limit: a hit
 // again changes nothing, an escape replaces the black sample with the color. So passes keep
@@ -77,7 +83,8 @@ void samplePattern(int n, std::vector<float2>& out);
 struct Accum {
   float4* color = nullptr;
   unsigned short* meta = nullptr;    // taken << 8 | hits (both saturate at 127), bit 7: certain interior
-  unsigned short* hitMask = nullptr;  // bit k set: sample k of the pattern hit the limit
+  unsigned short* hitMask = nullptr;  // bit k set: sample k of the pattern hit the limit (or is pending)
+  int* depth = nullptr;              // [pixel]: the depth its samples are resolved to (see docs/pending-samples.md)
   void* orbit = nullptr;             // [pixel * orbitSlots + slot]: z after orbitIters iterations (float2/double2)
   int* orbitIters = nullptr;         // [pixel * orbitSlots + slot]: iterations done (-1: free, INT_MAX: interior)
   float* mu = nullptr;               // [pixel * orbitSlots + slot]: smooth escape value of an escaped sample

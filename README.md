@@ -68,7 +68,11 @@ kernel time.
   per pixel (the second only if the first escaped) and is shown immediately when the view
   moves. The next passes double the count early, to 4, 8 and 16, at the current low limit,
   for pixels whose samples have all escaped: cheap antialiasing for the bulk of the exterior
-  right away. A pass stops at a pixel's first sample that hits the limit, so a pixel with
+  right away. A sample that arrives later than the pixel's others and has not been taken
+  as deep as they were resolved to (it ran out of the per-pass budget, or hit a lower limit
+  than they were probed under) is pending: it is resumed every pass but adds no black to
+  the mean until it has caught up, so a pixel never darkens while its extra samples are
+  still on their way (`docs/pending-samples.md` explains the rule in full). A pass stops at a pixel's first sample that hits the limit, so a pixel with
   unresolved hits can hold another count for a while; its hits are re-probed and replaced as
   the limit deepens, and the count reaches the power of two once they resolve or its
   remaining samples are taken. A pixel whose extra sample hits that limit drops back to its two primary

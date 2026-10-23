@@ -248,58 +248,6 @@ __device__ __forceinline__ int iterateSample(int x, int y, int w, int h, T cx, T
   return i;
 }
 
-// Gives every unfinished pixel its next sample, accumulated into `accum`.
-// Iterates sample `k` of pixel (x, y) up to maxIter, resuming from its stored orbit when
-// the slot holds one. Returns the iteration count reached (>= maxIter: hit) and leaves z in
-// zr/zi (zr2/zi2 = their squares). Stores the orbit of a hit so the next probe can resume.
-template <typename T>
-__device__ __forceinline__ int iterateSample(int x, int y, int w, int h, T cx, T cy, T scale, int k, int maxIter,
-                                             double2* orbit, int2* orbitAt, size_t slotBase, int slots, bool& bulb,
-                                             T& zr, T& zi, T& zr2, T& zi2) {
-  const float ox = c_offsets[k].x, oy = c_offsets[k].y;
-  const T cr = cx + (T(x) + T(ox) - T(w) * T(0.5)) * scale;
-  const T ci = cy - (T(y) + T(oy) - T(h) * T(0.5)) * scale;
-  zr = zi = zr2 = zi2 = 0;
-  bulb = inMainBulbs(cr, ci);
-  const size_t slot = slotBase + (size_t)(k % slots);
-  const int2 at = orbitAt[slot];
-  if (bulb) {
-    // Known interior at any limit: record that, so the sample never counts as lagging.
-    if (at.x < 0 || at.x == k) orbitAt[slot] = make_int2(k, INT_MAX);
-    return maxIter;
-  }
-  const bool resumable = at.x == k && at.y > 0;
-  int i = 0;
-  if (resumable) {
-    if (at.y >= maxIter) return at.y;  // already known to hit this limit
-    const double2 z = orbit[slot];
-    zr = (T)z.x;
-    zi = (T)z.y;
-    zr2 = zr * zr;
-    zi2 = zi * zi;
-    i = at.y;
-  }
-  // Large bailout radius makes the smooth iteration count accurate.
-  const T bailout = T(1 << 16);
-  while (i < maxIter && zr2 + zi2 <= bailout) {
-    zi = T(2) * zr * zi + ci;
-    zr = zr2 - zi2 + cr;
-    zr2 = zr * zr;
-    zi2 = zi * zi;
-    ++i;
-  }
-  if (i >= maxIter) {
-    // Hit the limit: keep the orbit for the next, deeper probe (a free slot, or this
-    // sample's own).
-    if (resumable || at.x < 0 || at.x == k) {
-      orbit[slot] = make_double2((double)zr, (double)zi);
-      orbitAt[slot] = make_int2(k, i);
-    }
-  } else if (resumable) {
-    orbitAt[slot].x = -1;  // escaped: the slot is free again
-  }
-  return i;
-}
 
 // The coarse image: iterates the center point of every 4x4 tile towards `target`, resuming
 // its stored orbit, at most `budget` iterations per pass, and records whether it has escaped.
@@ -430,17 +378,25 @@ __device__ __forceinline__ void accumulateSample(float4& a, float3 c, float wgt)
   a.w = __fmaf_rn(a.w, kSampleAging, wgt);
 }
 
+// Whether a hit sample's black counts: only once it has been taken as deep as the pixel is
+// resolved to (`depth`); a sample still short of that is pending and adds nothing.
+__device__ __forceinline__ bool hitCounts(int reached, int depth) { return reached >= depth; }
+
 // A pixel's color sum and weight from its samples, replayed in order with the same sequence
-// as the live accumulation: hits add black at kLimitHitWeight, escapes their color at weight
-// 1. Used after a rescue and for recoloring, so both stay identical.
+// as the live accumulation: hits that count add black at kLimitHitWeight, pending hits
+// nothing, escapes their color at weight 1. Used after every re-probe and for recoloring, so
+// all paths stay identical.
 __device__ __forceinline__ float4 replayPixel(int taken, unsigned mask, const float* __restrict__ muBuf,
-                                              size_t slotBase, int palette, float colorScale, float colorOffset) {
+                                              const int* __restrict__ orbitIters, size_t slotBase, int depth,
+                                              int palette, float colorScale, float colorOffset) {
   float4 a = make_float4(0, 0, 0, 0);
   for (int k = 0; k < taken; ++k) {
-    if ((mask >> k) & 1u)
-      accumulateSample(a, make_float3(0, 0, 0), kLimitHitWeight);
-    else
+    if ((mask >> k) & 1u) {
+      if (hitCounts(orbitIters[slotBase + (size_t)k], depth))
+        accumulateSample(a, make_float3(0, 0, 0), kLimitHitWeight);
+    } else {
       accumulateSample(a, colorize(muBuf[slotBase + (size_t)k], palette, colorScale, colorOffset), 1.0f);
+    }
   }
   return a;
 }
@@ -450,7 +406,8 @@ __device__ __forceinline__ float4 replayPixel(int taken, unsigned mask, const fl
 template <typename T>
 __global__ void __launch_bounds__(256)
 mandelbrotKernel(float4* __restrict__ accum, unsigned short* __restrict__ meta,
-                 unsigned short* __restrict__ hitMask, typename Vec2<T>::type* __restrict__ orbit,
+                 unsigned short* __restrict__ hitMask, int* __restrict__ depth,
+                 typename Vec2<T>::type* __restrict__ orbit,
                  int* __restrict__ orbitIters, float* __restrict__ muBuf, int orbitSlots,
                  const unsigned char* __restrict__ coarseHit, const int* __restrict__ coarseIters,
                  const unsigned char* __restrict__ tiles, const unsigned char* __restrict__ previewTiles,
@@ -517,6 +474,7 @@ mandelbrotKernel(float4* __restrict__ accum, unsigned short* __restrict__ meta,
     // the first pass takes two samples unless the first one hits.
     float4 a = accum[idx];
     int t = taken, nh = hits;
+    int dep = depth[idx];  // how deep the pixel's samples so far are resolved
     while (t < activeSamples) {
       T zr, zi, zr2, zi2;
       bool bulb, unfinished;
@@ -528,18 +486,21 @@ mandelbrotKernel(float4* __restrict__ accum, unsigned short* __restrict__ meta,
         // primary ones alone; the rest come after the depth phase at the settled depth.
         orbitIters[slotBase + (size_t)t] = -1;  // the orbit this probe stored
         orbitIters[slotBase + kPrimary] = kEarlyFailed;
-        accum[idx] = replayPixel(kPrimary, 0u, muBuf, slotBase, palette, colorScale, colorOffset);
+        accum[idx] = replayPixel(kPrimary, 0u, muBuf, orbitIters, slotBase, dep, palette, colorScale, colorOffset);
         meta[idx] = packCount(kPrimary, 0);
         hitMask[idx] = 0;
+        depth[idx] = dep;
         return;
       }
       certain = (t == 0 || certain) && bulb;  // all samples so far known interior
       exposed |= unfinished;
       if (hit) {
-        // Reached the limit: a black sample of weight kLimitHitWeight only.
+        // Reached the limit (or the budget): black, but only if taken as deep as the pixel's
+        // earlier samples were resolved; short of that it is pending and adds nothing yet.
         anyHit |= !bulb;
         mask |= 1u << t;
-        accumulateSample(a, make_float3(0, 0, 0), kLimitHitWeight);
+        if (hitCounts(i, dep)) accumulateSample(a, make_float3(0, 0, 0), kLimitHitWeight);
+        dep = max(dep, i);
         ++t;
         ++nh;
         break;
@@ -548,17 +509,20 @@ mandelbrotKernel(float4* __restrict__ accum, unsigned short* __restrict__ meta,
       const float mu = (float)i + 2.0f - log2f(log2f((float)(zr2 + zi2)));
       muBuf[slotBase + (size_t)t] = mu;
       accumulateSample(a, colorize(mu, palette, colorScale, colorOffset), 1.0f);
+      dep = max(dep, maxIter);  // escaped: resolved to this pass's limit (and beyond)
       ++t;
     }
     countStats(anyHit, false, 0, exposed);
     accum[idx] = a;
     meta[idx] = withCertain(packCount(t, nh), certain);
     hitMask[idx] = (unsigned short)mask;
+    depth[idx] = dep;
     return;
   }
 
-  // Every hit sample gets another go, resumed from its stored orbit.
+  // Every hit (or pending) sample gets another go, resumed from its stored orbit.
   int escaped = 0, maxEscape = 0;
+  int dep = depth[idx];
   for (unsigned rest = mask; rest;) {
     const int k = __ffs(rest) - 1;
     rest &= ~(1u << k);
@@ -573,17 +537,21 @@ mandelbrotKernel(float4* __restrict__ accum, unsigned short* __restrict__ meta,
     exposed |= unfinished;
     if (i >= maxIter || unfinished) {
       anyHit |= !bulb;
+      dep = max(dep, i);
     } else {
       muBuf[slot] = (float)i + 2.0f - log2f(log2f((float)(zr2 + zi2)));
       ++escaped;
       maxEscape = max(maxEscape, i);
       mask &= ~(1u << k);
+      dep = max(dep, maxIter);
     }
   }
   countStats(anyHit, escaped > 0, maxEscape, exposed);
-  if (escaped == 0) return;  // still interior at this limit: nothing new
-  // Rescued samples replace black ones: replay the pixel so the sums stay canonical.
-  accum[idx] = replayPixel(taken, mask, muBuf, slotBase, palette, colorScale, colorOffset);
+  // Rescued samples replace black ones and pending samples may have caught up: replay the
+  // pixel so the sums stay canonical.
+  depth[idx] = dep;
+  accum[idx] = replayPixel(taken, mask, muBuf, orbitIters, slotBase, dep, palette, colorScale, colorOffset);
+  if (escaped == 0) return;  // still interior at this limit: nothing else new
   meta[idx] = packCount(taken, hits - escaped);  // escaped: not certain
   hitMask[idx] = (unsigned short)mask;
 }
@@ -592,11 +560,12 @@ mandelbrotKernel(float4* __restrict__ accum, unsigned short* __restrict__ meta,
 // sequence as the live accumulation, so a recolored buffer continues seamlessly.
 __global__ void recolorKernel(float4* __restrict__ accum, const unsigned short* __restrict__ meta,
                               const unsigned short* __restrict__ hitMask, const float* __restrict__ muBuf,
-                              int orbitSlots, int n, int palette, float colorScale, float colorOffset) {
+                              const int* __restrict__ orbitIters, const int* __restrict__ depth, int orbitSlots,
+                              int n, int palette, float colorScale, float colorOffset) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  accum[i] = replayPixel(samplesTaken(meta[i]), hitMask[i], muBuf, (size_t)i * orbitSlots, palette, colorScale,
-                         colorOffset);
+  accum[i] = replayPixel(samplesTaken(meta[i]), hitMask[i], muBuf, orbitIters, (size_t)i * orbitSlots, depth[i],
+                         palette, colorScale, colorOffset);
 }
 
 __global__ void resolveKernel(const float4* __restrict__ accum, const unsigned short* __restrict__ meta,
@@ -707,6 +676,7 @@ __global__ void shiftKernel(Accum src, Accum dst, int w, int h, int sx, int sy) 
   dst.color[i] = inside ? src.color[o] : make_float4(0, 0, 0, 0);
   dst.meta[i] = inside ? src.meta[o] : (unsigned short)0;
   dst.hitMask[i] = inside ? src.hitMask[o] : (unsigned short)0;
+  dst.depth[i] = inside ? src.depth[o] : 0;
   // Both buffers have the same slot count and precision (the app keeps them in step).
   const int slots = dst.orbitSlots;
   const int units = dst.orbitDouble ? 2 : 1;  // 8-byte units per orbit
@@ -800,7 +770,7 @@ void launch(Accum accum, const unsigned char* tiles, const unsigned char* previe
         (T)p.centerX, (T)p.centerY, (T)p.scale, target, kCoarseBudgetFactor * budget);
     coarseHit = accum.coarseHit;
   }
-  mandelbrotKernel<T><<<gridFor(w, h, block), block>>>(accum.color, accum.meta, accum.hitMask,
+  mandelbrotKernel<T><<<gridFor(w, h, block), block>>>(accum.color, accum.meta, accum.hitMask, accum.depth,
                                                       (typename Vec2<T>::type*)accum.orbit, accum.orbitIters,
                                                       accum.mu, accum.orbitSlots, coarseHit, accum.coarseIters,
                                                       tiles, previewTiles, preview, trust, w, h, tw, th,
@@ -904,10 +874,12 @@ Accum allocAccum(int w, int h, int samples, bool useDouble) {
   Accum a;
   if (cudaMalloc(&a.color, (size_t)w * h * sizeof(float4)) != cudaSuccess ||
       cudaMalloc(&a.meta, (size_t)w * h * sizeof(unsigned short)) != cudaSuccess ||
-      cudaMalloc(&a.hitMask, (size_t)w * h * sizeof(unsigned short)) != cudaSuccess) {
+      cudaMalloc(&a.hitMask, (size_t)w * h * sizeof(unsigned short)) != cudaSuccess ||
+      cudaMalloc(&a.depth, (size_t)w * h * sizeof(int)) != cudaSuccess) {
     fprintf(stderr, "CUDA error: cannot allocate a %dx%d accumulation buffer\n", w, h);
     exit(1);
   }
+  cudaMemset(a.depth, 0, (size_t)w * h * sizeof(int));
   allocOrbits(a, w, h, samples, useDouble);
   return a;
 }
@@ -922,6 +894,7 @@ void freeAccum(Accum& a) {
   if (a.color) cudaFree(a.color);
   if (a.meta) cudaFree(a.meta);
   if (a.hitMask) cudaFree(a.hitMask);
+  if (a.depth) cudaFree(a.depth);
   freeOrbits(a);
   a = Accum();
 }
@@ -930,6 +903,7 @@ void clearSamples(Accum accum, int w, int h) {
   cudaMemsetAsync(accum.color, 0, (size_t)w * h * sizeof(float4));
   cudaMemsetAsync(accum.meta, 0, (size_t)w * h * sizeof(unsigned short));
   cudaMemsetAsync(accum.hitMask, 0, (size_t)w * h * sizeof(unsigned short));
+  cudaMemsetAsync(accum.depth, 0, (size_t)w * h * sizeof(int));
   cudaMemsetAsync(accum.orbitIters, 0xFF, (size_t)w * h * accum.orbitSlots * sizeof(int));  // -1: nothing stored
   cudaMemsetAsync(accum.coarseIters, 0xFF, (size_t)accum.tw * accum.th * sizeof(int));
   cudaMemsetAsync(accum.coarseHit, 0, (size_t)accum.tw * accum.th);
@@ -1047,8 +1021,8 @@ void shiftSamples(Accum src, Accum dst, int w, int h, int shiftX, int shiftY) {
 
 void recolorSamples(Accum accum, int w, int h, const ViewParams& p) {
   const int n = w * h;
-  recolorKernel<<<(n + 255) / 256, 256>>>(accum.color, accum.meta, accum.hitMask, accum.mu, accum.orbitSlots, n,
-                                          p.palette, p.colorScale, p.colorOffset);
+  recolorKernel<<<(n + 255) / 256, 256>>>(accum.color, accum.meta, accum.hitMask, accum.mu, accum.orbitIters,
+                                          accum.depth, accum.orbitSlots, n, p.palette, p.colorScale, p.colorOffset);
 }
 
 void resolveSamples(Accum accum, const uchar4* preview, float previewWeight, uchar4* out, int w, int h,
