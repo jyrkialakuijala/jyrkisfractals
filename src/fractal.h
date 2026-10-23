@@ -18,7 +18,7 @@ struct ViewParams {
   int palette = 0;
   float colorScale = 0.02f;   // palette cycles per iteration
   float colorOffset = 0.0f;   // phase shift of the palette, in cycles
-  int samples = 7;            // antialiasing: samples per pixel, 1..kMaxSamples (largest-gap pattern)
+  int samples = 8;            // antialiasing: samples per pixel, rounded up to a power of two <= kMaxSamples
   FractalType fractal = FractalType::Mandelbrot;
   Precision precision = Precision::Auto;
 };
@@ -38,24 +38,26 @@ constexpr int kPaletteCount = 6;
 // Below this pixel size single precision visibly breaks down, so Auto switches to double.
 constexpr double kDoubleThreshold = 1e-6;
 
-// Number of samples per pixel for this view (p.samples clamped to [1, kMaxSamples]).
+// Number of samples per pixel for this view: p.samples rounded up to a power of two (1, 2, 4, 8
+// or 16), so that the pixel averages are exact divisions.
 int totalSamples(const ViewParams& p);
 
 // The subpixel sample pattern for `n` samples (offsets in [-0.5, 0.5) about the pixel center,
 // in the order the samples are taken): a greedy largest-gap sequence with a little jitter.
 void samplePattern(int n, std::vector<float2>& out);
 
-// The accumulation buffer holds, per pixel, the aged color sum in color.xyz and its total
-// weight in color.w, plus two small counters in meta: the number of samples taken so far and
-// how many of them ran to the iteration limit (and a "certain interior" bit, see isCertain).
+// The accumulation buffer holds, per pixel, the color sum in color.xyz and its total weight
+// in color.w, plus two small counters in meta: the number of samples taken so far and how
+// many of them ran to the iteration limit (and a "certain interior" bit, see isCertain).
 // Row 0 is the top of the image.
 //
-// Adding a sample first multiplies the existing sum and weight by kSampleAging and then adds
-// the sample: an escaped sample adds its color with weight 1, a limit-hit sample adds black
-// with weight kLimitHitWeight only. So one unresolved sample barely darkens a pixel that
-// already has color, and every new sample counts a little more than the ones before it,
-// which is right because later samples are taken at a deeper iteration limit (progressive
-// deepening in the app). A pixel is "black" when every sample it has taken hit the limit.
+// Adding a sample multiplies the existing sum and weight by kSampleAging (1: no aging) and
+// adds the sample: an escaped sample adds its color, a limit-hit sample adds black, both at
+// weight 1 (kLimitHitWeight), so a pixel's color is the exact mean of its samples with black
+// for the ones that hit. The app takes samples in counts of 2, 4, 8 and 16, so the mean is a
+// division by a power of two, exact in floating point. A hit sample that escapes at a deeper
+// limit later is replaced by its color (replayPixel). A pixel is "black" when every sample it
+// has taken hit the limit.
 //
 // hitMask remembers which of the pixel's samples hit the limit. Once a pixel has all its
 // samples, every pass re-probes one of those samples at the current (deeper) limit: a hit
@@ -92,8 +94,8 @@ struct Accum {
   int* coarseIters = nullptr;        // [tile]: iterations done (-1: start over)
   unsigned char* coarseHit = nullptr;  // [tile]: 1 if the point has not escaped within coarseIters iterations
 };
-constexpr float kLimitHitWeight = 1.0f / 16;
-constexpr float kSampleAging = 0.9f;
+constexpr float kLimitHitWeight = 1.0f;
+constexpr float kSampleAging = 1.0f;
 // A sample iterates at most this many iterations in one pass. One that has neither escaped
 // nor reached the limit by then stores its orbit as in progress, counts as a hit (black) for
 // the time being and as newly exposed (so the deepening waits), and continues next pass. This
@@ -147,8 +149,8 @@ FRACTAL_HD inline unsigned short withCertain(unsigned short m, bool certain) {
   return (unsigned short)(certain ? (m | 128) : (m & ~128));
 }
 // Weight of the zoom preview prior after `passes` passes on the current view: kPreviewWeight
-// samples at first, aged like the samples (0.9 per pass) and faded out entirely by the time
-// every pixel has all its samples, so nothing of the magnified old image lingers.
+// samples at first, aged like the samples (kSampleAging per pass) and faded out entirely by
+// the time every pixel has all its samples, so nothing of the magnified old image lingers.
 inline float priorWeight(float weight, int passes, int totalSamples) {
   if (passes >= totalSamples) return 0.0f;
   return weight * powf(kSampleAging, (float)passes) * (1.0f - (float)passes / (float)totalSamples);
@@ -197,9 +199,12 @@ void clearSamples(Accum accum, int w, int h);
 // `shallowIter`: the limit the preview's kPreviewAlphaShallow pixels (the surround fill) were
 // computed with; they are trusted like the others, but only to that depth.
 // `iterBudget`: iterations per sample in this pass at most (0: kIterBudget), see kIterBudget.
+// `coarseChase`: the coarse image runs towards the preview's depth (beyond this pass's limit)
+// so it can clear trusted preview colors it has verified deeper; false after a zoom in, where
+// it tracks the pass's limit only and no computation towards the old depth carries over.
 RenderStats renderPass(Accum& accum, int w, int h, const ViewParams& p, const uchar4* preview = nullptr,
                        int previewIter = 0, int settledIter = 0, int activeSamples = 0, bool earlyAA = false,
-                       int shallowIter = 0, int iterBudget = 0);
+                       int shallowIter = 0, int iterBudget = 0, bool coarseChase = true);
 
 // Translation reuse: dst(x, y) = src(x + shiftX, y + shiftY) where that lies inside the
 // image, zero samples elsewhere. Asynchronous.

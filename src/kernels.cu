@@ -383,8 +383,9 @@ __device__ __forceinline__ bool coarseInterior(const unsigned char* hit, const i
          coarseHitAt(hit, iters, tx, ny, tw, th, depth) && coarseHitAt(hit, iters, nx, ny, tw, th, depth);
 }
 
-// Ages the accumulation and adds one sample (color c at weight wgt). Written with explicit
-// fused multiply-adds so that every path (live and replay) rounds identically.
+// Adds one sample (color c at weight wgt) to the accumulation, aged by kSampleAging (1: a
+// plain sum). Written with explicit fused multiply-adds so that every path (live and replay)
+// rounds identically.
 __device__ __forceinline__ void accumulateSample(float4& a, float3 c, float wgt) {
   a.x = __fmaf_rn(a.x, kSampleAging, c.x);
   a.y = __fmaf_rn(a.y, kSampleAging, c.y);
@@ -392,9 +393,9 @@ __device__ __forceinline__ void accumulateSample(float4& a, float3 c, float wgt)
   a.w = __fmaf_rn(a.w, kSampleAging, wgt);
 }
 
-// A pixel's color sum and weight from its samples, replayed in order with the same
-// age-then-add sequence as the live accumulation: hits add kLimitHitWeight of black, escapes
-// their color at weight 1. Used after a rescue and for recoloring, so both stay identical.
+// A pixel's color sum and weight from its samples, replayed in order with the same sequence
+// as the live accumulation: hits add black at kLimitHitWeight, escapes their color at weight
+// 1. Used after a rescue and for recoloring, so both stay identical.
 __device__ __forceinline__ float4 replayPixel(int taken, unsigned mask, const float* __restrict__ muBuf,
                                               size_t slotBase, int palette, float colorScale, float colorOffset) {
   float4 a = make_float4(0, 0, 0, 0);
@@ -682,7 +683,12 @@ __global__ void shiftKernel(Accum src, Accum dst, int w, int h, int sx, int sy) 
   }
 }
 
-int clampSamples(int n) { return std::min(std::max(n, 1), kMaxSamples); }
+int clampSamples(int n) {
+  n = std::min(std::max(n, 1), kMaxSamples);
+  int p = 1;
+  while (p < n) p <<= 1;  // up to a power of two: 1, 2, 4, 8, 16
+  return p;
+}
 
 // Fills `out` with the aa*aa subpixel offsets (in [-0.5, 0.5) about the pixel center) in the
 // order samples are taken. The pattern is a greedy largest-gap sequence: the first sample is
@@ -741,15 +747,17 @@ dim3 gridFor(int w, int h, dim3 block) { return dim3((w + block.x - 1) / block.x
 template <typename T>
 void launch(Accum accum, const unsigned char* tiles, const unsigned char* previewTiles, const uchar4* preview,
             PreviewTrust trust, int w, int h, int tw, int th, const ViewParams& p, int total, int activeSamples,
-            bool earlyAA, int settledIter, int budget) {
+            bool earlyAA, int settledIter, int budget, bool coarseChase) {
   dim3 block(32, 8);
-  // The coarse image first (cheap: one point per tile, resumed), then the pixels. It runs
-  // towards the deeper of the pass's limit and the trusted preview's depth, so that it can
-  // clear preview colors that were tested deeper than the pixels have been probed so far.
+  // The coarse image first (cheap: one point per tile, resumed), then the pixels. With
+  // coarseChase it runs towards the deeper of the pass's limit and the trusted preview's
+  // depth, so that it can clear preview colors that were tested deeper than the pixels have
+  // been probed so far; without it (after a zoom in) it tracks the pass's limit only, so no
+  // computation towards the previous view's depth carries over into the new view.
   const unsigned char* coarseHit = nullptr;
   static const bool noCoarse = getenv("JF_NO_COARSE") != nullptr;  // A/B switch for the coarse image
   if (tiles && !noCoarse) {
-    const int target = max(p.maxIter, max(trust.deep, trust.shallow));
+    const int target = coarseChase ? max(p.maxIter, max(trust.deep, trust.shallow)) : p.maxIter;
     coarseKernel<T><<<gridFor(accum.tw, accum.th, block), block>>>(
         (typename Vec2<T>::type*)accum.coarseOrbit, accum.coarseIters, accum.coarseHit, w, h, accum.tw, accum.th,
         (T)p.centerX, (T)p.centerY, (T)p.scale, target, kCoarseBudgetFactor * budget);
@@ -891,7 +899,8 @@ void clearSamples(Accum accum, int w, int h) {
 }
 
 RenderStats renderPass(Accum& accum, int w, int h, const ViewParams& p, const uchar4* preview, int previewIter,
-                       int settledIter, int activeSamples, bool earlyAA, int shallowIter, int iterBudget) {
+                       int settledIter, int activeSamples, bool earlyAA, int shallowIter, int iterBudget,
+                       bool coarseChase) {
   const PreviewTrust trust = {preview ? previewIter : 0, preview ? shallowIter : 0};
   if (iterBudget <= 0) iterBudget = kIterBudget;
   const int total = totalSamples(p);
@@ -914,10 +923,10 @@ RenderStats renderPass(Accum& accum, int w, int h, const ViewParams& p, const uc
   tileMaps(accum.meta, preview, trust, p.maxIter, w, h, tw, th, tiles, previewTiles);
   if (st.usedDouble)
     launch<double>(accum, tiles, previewTiles, preview, trust, w, h, tw, th, p, total, activeSamples, earlyAA,
-                   settledIter, iterBudget);
+                   settledIter, iterBudget, coarseChase);
   else
     launch<float>(accum, tiles, previewTiles, preview, trust, w, h, tw, th, p, total, activeSamples, earlyAA,
-                  settledIter, iterBudget);
+                  settledIter, iterBudget, coarseChase);
   cudaEventRecord(e1);
   cudaError_t err = cudaMemcpyFromSymbol(counts, d_counts, sizeof counts);  // also waits for the pass
   if (err == cudaSuccess) err = cudaGetLastError();

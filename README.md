@@ -24,7 +24,7 @@ If you have a regular CUDA install and the `-dev` packages, override the default
     ./jyrkisfractals --size 2560x1440
     ./jyrkisfractals --center -0.7436438870371 0.1318259042053 --zoom 2e9
     ./jyrkisfractals --headless out.png --size 3840x2160 --iter 5000   # no window
-    ./jyrkisfractals --aa 16                                             # 16 samples per pixel
+    ./jyrkisfractals --aa 16                                             # 16 samples per pixel (1, 2, 4, 8 or 16)
     ./jyrkisfractals --bench 200 --size 1920x1080                      # kernel timing
     ./jyrkisfractals --help
 
@@ -36,7 +36,7 @@ If you have a regular CUDA install and the `-dev` packages, override the default
 | Z / X              | zoom in / out around the center                   |
 | PgUp / PgDn        | zoom in / out around the mouse pointer            |
 | arrows             | pan by a tenth of the window                      |
-| 1 .. 9, 0          | antialiasing: samples per pixel (0 = 16, default 7)|
+| 1 .. 9, 0          | antialiasing: samples per pixel, rounded up to 1, 2, 4, 8 or 16 (0 = 16, default 8)|
 | + / -              | more / fewer iterations (turns off auto)          |
 | A                  | toggle automatic iteration count                  |
 | D                  | precision: auto / float / double                  |
@@ -61,18 +61,23 @@ kernel time.
   registered with CUDA. Each frame maps the buffer, launches the kernel, unmaps, and
   uploads to a texture without touching host memory. If interop registration fails the
   viewer falls back to a device-to-host copy automatically.
-- Antialiasing is progressive supersampling with up to 16 samples per pixel (keys 1..9 and 0
-  for 16; default 7, enough for the largest-gap pattern and light on memory and time): the
-  first sample is shown
-  immediately when the view moves. The next passes take the remaining samples early, at the
-  current low limit, for pixels whose samples have all escaped: cheap antialiasing for the
-  bulk of the exterior right away. A pixel whose extra sample hits that limit drops back to its two primary
+- Antialiasing is progressive supersampling with 1, 2, 4, 8 or 16 samples per pixel (keys
+  1..9 round up to the next power of two, 0 is 16; default 8). A pixel's color is the exact
+  mean of its samples, black for the ones that ran to the limit, and since the counts are
+  powers of two the division is exact in floating point. The first pass takes two samples
+  per pixel (the second only if the first escaped) and is shown immediately when the view
+  moves. The next passes double the count early, to 4, 8 and 16, at the current low limit,
+  for pixels whose samples have all escaped: cheap antialiasing for the bulk of the exterior
+  right away. A pass stops at a pixel's first sample that hits the limit, so a pixel with
+  unresolved hits can hold another count for a while; its hits are re-probed and replaced as
+  the limit deepens, and the count reaches the power of two once they resolve or its
+  remaining samples are taken. A pixel whose extra sample hits that limit drops back to its two primary
   samples alone (the extra ones are ignored, the primary ones never touched) and gets its
   remaining samples after the depth phase instead. Depth comes before antialiasing for those: the deepening described below
   runs on their single sample until it has settled (nothing newly exposed and
   fewer than 5 pixels rescued by a deepening pass, or the limit has caught up with a trusted
-  preview), and only then do the remaining samples accumulate in a float buffer, one per
-  pass at that depth, within an 8 ms kernel budget per displayed frame; the deepening
+  preview), and only then do the remaining samples accumulate in a float buffer, doubling
+  the count per pass at that depth, within an 8 ms kernel budget per displayed frame; the deepening
   resumes afterwards. A pixel whose four neighbours are black keeps its single sample and
   gets no further subpixels, since those would almost surely run to the limit too. The sample pattern is not a grid: the first sample is the pixel
   center and every next one lands in the biggest gap left in the pixel square (measured
@@ -96,15 +101,13 @@ kernel time.
   trusted to the depth the previous view reached (the alpha classes carry this through any
   number of further zooms). So a sequence of zoom-outs never flickers to black in the ring
   the view just uncovered.
-- Interior pixels are cheap and get deepened instead of antialiased. Each pixel keeps an
-  aged color sum and its weight: adding a sample first scales what is there by 0.9 and then
-  adds the sample, an escaped sample with weight 1 and a sample that ran to the iteration
-  limit as black with weight 1/16. So one unresolved sample barely darkens a pixel that
-  already has color, only a pixel whose samples all hit the limit is black, and every new
-  sample counts a little more than the ones before it, which is right because later samples
-  are taken at a deeper limit: whenever a pass had limit-hit pixels, the effective limit for
-  the next pass grows by 500, so "false interior" pixels that merely needed more iterations
-  get resolved while the view sits still. Each pixel remembers which of its samples hit the
+- Interior pixels are cheap and get deepened instead of antialiased. Each pixel keeps its
+  color sum and sample count: an escaped sample adds its color, a sample that ran to the
+  iteration limit adds black, and the pixel shows the plain mean. Only a pixel whose samples
+  all hit the limit is pure black; a hit sample that escapes at a deeper limit later is
+  replaced by its color: whenever a pass had limit-hit pixels, the effective limit for the
+  next pass grows by 500, so "false interior" pixels that merely needed more iterations get
+  resolved while the view sits still. Each pixel remembers which of its samples hit the
   limit, and once all its samples are taken those exact samples are re-probed at the deeper
   limit every pass: a hit again changes nothing, an escape replaces the black sample with
   its color. The orbit (z, iterations done) of every hit sample is stored per pixel and
@@ -113,17 +116,17 @@ kernel time.
   smooth escape value of an escaped sample, so palette, color scale and color offset changes
   (`P`, `[`, `]`, `,`, `.`) only recolor the kept samples instead of re-rendering. That
   storage is 16 bytes per sample per pixel in single precision (24 in double) plus 20 bytes
-  of bookkeeping per pixel, all of a pixel's samples contiguous: about 135 MB at 1280x800
-  with 7 samples (205 MB in double), small enough to be cache friendly for the boundary
+  of bookkeeping per pixel, all of a pixel's samples contiguous: about 150 MB at 1280x800
+  with 8 samples (220 MB in double), small enough to be cache friendly for the boundary
   pixels a pass touches. If it cannot be allocated the viewer says so and exits. Each pass counts how many probed pixels ran to the limit (the title shows it as
   `hits 37`), and passes keep going, raising the limit by 500 each, until fewer than 5 pixels
   hit or the limit reaches 4194304. The limit is held steady in any pass that re-probed
   pixels the eroding black region had just exposed (their stored orbits lag behind the
   previous pass), so the erosion catches up at the current depth before deepening goes on. Pixels at the edge of true interior hit at every limit,
   so a view with real interior on screen keeps deepening until that cap. The adjustment
-  resets to 0 on every zoom and the title shows it as `iter 3438+3000`. The zoom preview prior ages the same way (8 samples
-  times 0.9 per pass, and faded out entirely by the time all samples are in, so nothing of
-  the magnified old image lingers), but a pixel whose samples all hit the limit is shown as
+  resets to 0 on every zoom and the title shows it as `iter 3438+3000`. The zoom preview prior counts as 8 samples
+  at first and fades out entirely by the time all samples are in, so nothing of
+  the magnified old image lingers, but a pixel whose samples all hit the limit is shown as
   pure black whatever the preview says, with one exception: the preview remembers the
   depth its colors were tested to (the limit the previous view reached), and where that is
   higher than the current pass's limit and the preview shows color, the pixel is not taken
@@ -160,9 +163,11 @@ kernel time.
   4096. The title shows `(budget cut)` while it is lowered.
 - A coarse image guards the interior. Every pass first iterates one point per 4x4 tile (the
   tile center), resumed from its stored orbit like the pixels' samples, so it costs next to
-  nothing. Its budget is four times the pixels' per pass, and it runs towards the deeper of
-  the pass's limit and the depth a trusted preview's colors were tested to, so it can be
-  ahead of the pixels. A pixel whose 2x2 nearest coarse points have all been taken without
+  nothing. Its budget is four times the pixels' per pass. After a zoom out or a pan it runs
+  towards the deeper of the pass's limit and the depth a trusted preview's colors were tested
+  to, so it can be ahead of the pixels; after a zoom in it starts clean and follows the new
+  view's limit only, so no computation towards the previous view's depth carries over (the
+  preview's colors then give way to the pixels' own deepening). A pixel whose 2x2 nearest coarse points have all been taken without
   escaping at least as deep as the pixel's own depth, the limit it probes to, or, where it
   shows a trusted preview's color, the depth that color was tested to, is taken as black
   without being computed at all, not even its first sample, and shown as pure black whatever
@@ -184,7 +189,8 @@ kernel time.
 - Nothing flashes black. `--test-flicker F` converges a view the way the GUI does, zooms by
   `F` (below 1: out) about the center, and checks every frame until the new view has
   converged too: a pixel the preview showed colored and that is colored at the end must never
-  have been black in between. Colors the preview held as trusted may not flash at all; the
+  have been black by rule in between (all samples hit, or blocked by the coarse image; an
+  exact mean of near-black palette colors can round to zero and does not count). Colors the preview held as trusted may not flash at all; the
   surround fill is approximate, so up to 0.5% of its pixels may (a pixel colored in the
   surround at 1000 iterations can hit a deeper limit and be rescued deeper still).
   `JF_FLICKER_DUMP=1` lists some of the offending pixels, `JF_FLICKER_PIXEL="x y"` traces one
@@ -201,7 +207,7 @@ Measured on an RTX 5090 at 1920x1080 with 16 samples: the default view at 256 it
 takes about 2 ms of kernel time for all samples; a 2e9x zoom at ~3400 iterations in double
 precision takes about 25 ms per sample, so the first sample appears immediately and the rest
 arrive over a fraction of a second (double throughput on consumer GPUs is 1/64 of float).
-The default of 7 samples cuts both the time and the storage by more than half.
+The default of 8 samples halves both the time and the storage.
 
 ## Next steps
 

@@ -129,7 +129,7 @@ void usage() {
       "  --scale S           complex units per pixel\n"
       "  --zoom Z            magnification relative to the default view (alternative to --scale)\n"
       "  --iter N            max iterations (disables auto)\n"
-      "  --aa N              antialiasing, samples per pixel, 1..%d (default 7)\n"
+      "  --aa N              antialiasing, samples per pixel, 1..%d, rounded up to a power of two (default 8)\n"
       "  --palette N         palette 0..%d\n"
       "  --precision MODE    auto | float | double\n"
       "  --headless out.png  render one frame to a PNG without opening a window\n"
@@ -676,6 +676,7 @@ struct Renderer {
   int w = 0, h = 0;  // image size in pixels
   int maxIterCap = kMaxIter;  // the effective limit never exceeds this (the self-tests lower it)
   int iterBudget = kIterBudget;  // iterations per sample and pass at most (lowered after slow frames)
+  bool coarseChase = true;  // the coarse image may run ahead to the preview's depth (not after a zoom in)
   Accum accum;                         // sample accumulation buffer
   Accum accum2;                        // scratch for translating the accumulation buffer
   uchar4* display = nullptr;           // the image currently shown
@@ -725,14 +726,19 @@ struct Renderer {
 
   double zoom() const { return defaultScale(w) / view.scale; }
   int effectiveIter() const { return std::min(view.maxIter + iterAdjust, maxIterCap); }
-  // Samples per pixel allowed so far: one while deepening, then one more per pass.
-  // Two samples per pixel in the first pass (the second only if the first escaped), then one
-  // more early extra sample per pass at the low limit (see earlyAA), one sample per pixel
-  // while deepening, then one more per pass for the pixels still missing them.
-  bool earlyAA() const { return passes < totalSamples(view) - 1; }
+  // Samples per pixel allowed so far: two in the first pass (the second only if the first
+  // escaped), doubling in every early pass at the low limit (4, 8, 16; see earlyAA), one per
+  // pixel while deepening, then doubling again per pass for the pixels still missing them.
+  // Counts stay powers of two, so a pixel's mean color is an exact division.
+  int earlyPasses() const {
+    int n = 0;
+    while ((2 << n) <= totalSamples(view)) ++n;
+    return n;
+  }
+  bool earlyAA() const { return passes < earlyPasses(); }
   int samplesActive() const {
-    if (earlyAA()) return std::min(totalSamples(view), passes + 2);
-    return depthReached ? std::min(totalSamples(view), 1 + passes - aaStartPass) : 1;
+    if (earlyAA()) return std::min(totalSamples(view), 2 << passes);
+    return depthReached ? std::min(totalSamples(view), 2 << (passes - aaStartPass)) : 1;
   }
   bool converged() const { return aaDone; }
   // Nothing left to do for this view: all samples taken and (almost) no pixel still hits the
@@ -868,6 +874,11 @@ struct Renderer {
       // its deeper colors through the preview until the deepening has caught up. Iteration
       // keys reset the adjustment themselves; other appearance changes keep the depth.
       const bool zoomingOut = view.scale > shownView.scale;
+      // After a zoom in the coarse field starts clean and follows the new view's limit only:
+      // it does not chase the previous view's depth, so nothing of that computation
+      // propagates into the new view. A zoom out keeps the chase, which clears the covered
+      // area's stale preview colors at the depth they were tested to.
+      coarseChase = zoomingOut;
       const int keep = appearanceChanged ? effectiveIter() : zoomingOut ? 0 : displayUseful;
       if (autoIter) view.maxIter = autoIterations(zoom());
       iterAdjust = std::max(0, std::min(keep, maxIterCap) - view.maxIter);
@@ -879,6 +890,7 @@ struct Renderer {
       shiftSamples(accum, accum2, w, h, pendingShiftX, pendingShiftY);
       std::swap(accum, accum2);
       firstPassIsFull = false;
+      coarseChase = true;
     }
     pendingShiftX = pendingShiftY = 0;
     passes = 0;
@@ -912,7 +924,7 @@ struct Renderer {
       const bool deepened = v.maxIter > sampleIter;  // this pass went deeper than the last one
       const bool early = earlyAA();
       stats = renderPass(accum, w, h, v, previewWeight > 0 ? preview : nullptr, previewIter, sampleIter, active,
-                         early, shallowIter(), iterBudget);
+                         early, shallowIter(), iterBudget, coarseChase);
       sampleIter = v.maxIter;
       if (depthReached && active >= totalSamples(view)) aaDone = true;
       // The depth this view really needed: beyond the last pass that still rescued a
@@ -932,7 +944,7 @@ struct Renderer {
       // Depth first, with one sample per pixel: the antialiasing samples start once the
       // deepening has settled, i.e. nothing is being exposed and (almost) nothing is rescued
       // any more, or the limit has caught up with a trusted preview, or it cannot grow.
-      if (!depthReached && passes >= totalSamples(view) && stats.exposedCount == 0) {
+      if (!depthReached && passes > earlyPasses() && stats.exposedCount == 0) {
         const bool trickle = deepened && stats.rescueCount < kFewHits;  // a held limit rescues nothing anyway
         const bool caughtUp = previewIter > 0 && effectiveIter() >= previewIter &&
                               stats.rescueCount < std::max(kFewHits, stats.hitCount / 100);
@@ -1118,7 +1130,7 @@ struct App : Renderer {
     const bool shift = k.keysym.mod & KMOD_SHIFT;
     const double panStep = 0.1;
     const SDL_Keycode sym = k.keysym.sym;
-    if (sym >= SDLK_0 && sym <= SDLK_9) {  // samples per pixel: 1..9, and 0 for the maximum
+    if (sym >= SDLK_0 && sym <= SDLK_9) {  // samples per pixel: 1..9 rounded up to a power of two, 0: 16
       view.samples = sym == SDLK_0 ? kMaxSamples : sym - SDLK_0;
       dirty = true;
       return;
@@ -1254,7 +1266,9 @@ struct App : Renderer {
 // Self-test for the zoom schedule: converges a view exactly as the GUI does (one pass per
 // frame), zooms by `factor` about the center (less than 1: out), and watches every frame until
 // the new view has converged too. Black must not appear temporarily: a pixel that the preview
-// showed colored and that ends up colored must never be black in between. Colors the preview
+// showed colored and that ends up colored must never be black by rule (all samples hit, or
+// blocked by the coarse image) in between; an exact mean of near-black palette colors may
+// round to zero and does not count. Colors the preview
 // held as trusted (alpha kPreviewAlphaTrusted) must never flash at all; colors from the
 // shallow surround fill (the border of a zoom out) are approximate, so a small share may.
 int testFlicker(const Options& o, double factor) {
@@ -1286,6 +1300,8 @@ int testFlicker(const Options& o, double factor) {
   grab(prior);  // the preview frame: what the screen shows right after the zoom
   const float surroundMs = r.surroundMs;
   std::vector<int> firstBlack(n, 0);  // pass at which the pixel first showed black (0: never)
+  std::vector<float> passWeights;
+  std::vector<unsigned short> passMeta;
   int passesB = 0;
   int px = -1, py = -1;  // JF_FLICKER_PIXEL="x y": trace this pixel through the passes
   if (const char* e = getenv("JF_FLICKER_PIXEL")) sscanf(e, "%d %d", &px, &py);
@@ -1293,9 +1309,13 @@ int testFlicker(const Options& o, double factor) {
     r.renderPasses(0);
     ++passesB;
     grab(frame);
+    // Black by rule, not by color: a pixel whose samples all hit (or that the coarse image
+    // blocked) and that shows black. An exact mean of near-black palette colors and hit
+    // samples can round to zero too, and that is no flash.
+    readCounts(r.accum, r.w, r.h, passWeights, passMeta);
     for (size_t i = 0; i < n; ++i)
-      if (!firstBlack[i] && !colored(frame, i)) firstBlack[i] = passesB;
-    if (px >= 0 && passesB <= 12) {
+      if (!firstBlack[i] && !colored(frame, i) && showsBlack(passMeta[i])) firstBlack[i] = passesB;
+    if (px >= 0 && passesB <= 16) {
       std::vector<float> wts;
       std::vector<unsigned short> mt;
       readCounts(r.accum, r.w, r.h, wts, mt);
