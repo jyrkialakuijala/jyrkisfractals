@@ -151,6 +151,22 @@ kernel time.
   stop before the limit has reached the preview's, so every such pixel ends up either
   confirmed by an escape or replaced by black; with resumed orbits that costs little.
   Headless renders use the given limit without deepening.
+- A zoom plans its first pass with the coarse field. Before the first full-resolution pass of
+  a zoomed view, the 4x4 coarse image alone probes the view, in stages that double the limit
+  from the auto limit up to the depth the previous image needed (a zoom out probes the auto
+  limit only), until the probing has spent 10 ms of kernel time (it usually takes a fraction
+  of a millisecond; about 2 ms at deep double-precision zooms). Each stage predicts the cost
+  of a first pass at that depth from the field: the 16 pixels of an escaped point cost about
+  what the point took, per sample; pixels around a boundary point (one with an escaped
+  neighbour) one sample at the limit, capped by the per-pass budget; blocked interior pixels
+  nothing. The deepest stage that fits 30 ms with the two primary samples sets the starting
+  limit (failing that, the auto limit with one sample), and the sample count then doubles,
+  up to the full count, while the prediction still fits. The rate behind the prediction is
+  what the last first pass really achieved in that precision, learned from its measured
+  time, so predictions settle within a few percent after the first zoom (the probe's own
+  rate, which runs far fewer threads, stands in before that and errs on the slow side). The
+  probed field stays for the passes, which block with it from the start. `JF_TRACE=1`
+  prints the stages and the plan.
 - Every pass is bounded. A sample iterates at most 4096 iterations in one pass; one that has
   neither escaped nor reached the limit by then stores its orbit as in progress, counts as
   black for the time being and as newly exposed, so the deepening waits, and continues next

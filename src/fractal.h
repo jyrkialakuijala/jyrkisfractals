@@ -91,7 +91,7 @@ struct Accum {
   // pixel is taken as interior, cleared to black and not computed (see isCoarseBlack).
   int tw = 0, th = 0;                // tiles per axis
   void* coarseOrbit = nullptr;       // [tile]: z after coarseIters iterations (float2/double2)
-  int* coarseIters = nullptr;        // [tile]: iterations done (-1: start over)
+  int* coarseIters = nullptr;        // [tile]: iterations done (-1: start over, <= kCoarseEscaped: escaped, see below)
   unsigned char* coarseHit = nullptr;  // [tile]: 1 if the point has not escaped within coarseIters iterations
 };
 constexpr float kLimitHitWeight = 1.0f;
@@ -109,6 +109,20 @@ constexpr int kIterBudget = 4096;
 // pixels' worst-case work; it lets the coarse image run ahead of the pixels, to the depth a
 // trusted preview's colors were tested to.
 constexpr int kCoarseBudgetFactor = 4;
+// A coarse point that escaped at iteration i stores kCoarseEscaped - i in coarseIters: never
+// iterated again, and the escape iteration stays available for the cost model of coarsePass.
+constexpr int kCoarseEscaped = -2;
+
+// Statistics of the coarse field after coarsePass: see that function.
+struct CoarseStats {
+  float kernelMs = 0;        // time of this call
+  int points = 0;            // coarse points in all
+  int hits = 0;              // points that have not escaped (to the depth they were taken)
+  int boundary = 0;          // of those, points with an escaped neighbour
+  double escapedIters = 0;   // iterations the escaped points took, in all
+  double work = 0;           // iterations done by every point so far, in all
+  bool complete = false;     // every point has either escaped or reached `target`
+};
 
 // The alpha channel of a preview / display pixel is its weight (0: nothing rendered there) and
 // says how far its colors are trusted: kPreviewAlphaTrusted marks colors tested to the previous
@@ -205,6 +219,14 @@ void clearSamples(Accum accum, int w, int h);
 RenderStats renderPass(Accum& accum, int w, int h, const ViewParams& p, const uchar4* preview = nullptr,
                        int previewIter = 0, int settledIter = 0, int activeSamples = 0, bool earlyAA = false,
                        int shallowIter = 0, int iterBudget = 0, bool coarseChase = true);
+
+// Runs the coarse 4x4 image alone, towards `target` with at most `budget` iterations per point
+// (the per-sample budget times kCoarseBudgetFactor), resuming as in a pass, and returns its
+// statistics. The app probes a new view with this before its first pass, staged from the auto
+// limit up to the inherited depth, to predict the first pass's cost from the points' escape
+// iterations and the boundary points, and to pick the depth and sample count that fit the
+// time budget. The field stays in `accum` for the passes that follow. Synchronous.
+CoarseStats coarsePass(Accum& accum, int w, int h, const ViewParams& p, int target, int budget);
 
 // Translation reuse: dst(x, y) = src(x + shiftX, y + shiftY) where that lies inside the
 // image, zero samples elsewhere. Asynchronous.

@@ -99,6 +99,11 @@ const int kFlickerTestCap = 1 << 15;
 const double kSlowFrameMs = 100.0;
 const double kFrameTargetMs = 50.0;
 const int kMinIterBudget = 64;
+// Before the first pass of a zoomed view the coarse 4x4 field probes it (Renderer::planFirstPass):
+// the probing may spend this much kernel time, and the first pass is planned (depth, samples)
+// to stay within this predicted time.
+const double kProbeBudgetMs = 10.0;
+const double kFirstPassTargetMs = 30.0;
 
 struct Options {
   int width = 1280, height = 800;
@@ -677,6 +682,10 @@ struct Renderer {
   int maxIterCap = kMaxIter;  // the effective limit never exceeds this (the self-tests lower it)
   int iterBudget = kIterBudget;  // iterations per sample and pass at most (lowered after slow frames)
   bool coarseChase = true;  // the coarse image may run ahead to the preview's depth (not after a zoom in)
+  int firstSamples = 2;     // samples per pixel the first pass of this view takes (planFirstPass)
+  float plannedMs = 0;      // predicted cost of that first pass
+  double plannedWork = 0;   // the modelled iterations of that first pass (calibrates the rate)
+  double rateFloat = 0, rateDouble = 0;  // iterations per ms a full pass achieves, learned from first passes
   Accum accum;                         // sample accumulation buffer
   Accum accum2;                        // scratch for translating the accumulation buffer
   uchar4* display = nullptr;           // the image currently shown
@@ -732,12 +741,12 @@ struct Renderer {
   // Counts stay powers of two, so a pixel's mean color is an exact division.
   int earlyPasses() const {
     int n = 0;
-    while ((2 << n) <= totalSamples(view)) ++n;
+    while ((firstSamples << n) <= totalSamples(view)) ++n;
     return n;
   }
   bool earlyAA() const { return passes < earlyPasses(); }
   int samplesActive() const {
-    if (earlyAA()) return std::min(totalSamples(view), 2 << passes);
+    if (earlyAA()) return std::min(totalSamples(view), firstSamples << passes);
     return depthReached ? std::min(totalSamples(view), 2 << (passes - aaStartPass)) : 1;
   }
   bool converged() const { return aaDone; }
@@ -806,6 +815,75 @@ struct Renderer {
   }
   int shallowIter() const { return surroundValid ? surroundView.maxIter : 0; }
 
+  // Probes a new view with the coarse 4x4 field before its first pass and plans that pass to
+  // stay within kFirstPassTargetMs. The field is taken in stages from the auto limit `d0`,
+  // doubling up to the inherited depth `d1`, until the probing has used kProbeBudgetMs. At
+  // each complete stage the first pass's cost is predicted from the field: the 16 pixels of
+  // an escaped point cost about what the point took, per sample; those around a boundary
+  // point (one with an escaped neighbour) one sample at the limit, capped by the per-pass
+  // budget (the pass stops at a pixel's first hit); blocked interior pixels nothing. The rate
+  // is the one the last planned first pass achieved in this precision (the probe's own rate
+  // until then, which runs far fewer threads and so errs on the slow side). The deepest stage
+  // that fits with the two primary samples wins, failing that the shallowest with one sample,
+  // and the sample count then doubles while it still fits. The field stays for the passes,
+  // which block with it from the start.
+  void planFirstPass(int d0, int d1) {
+    const int total = totalSamples(view);
+    ViewParams v = view;
+    double probeMs = 0;
+    int bestDepth = d0, bestSamples = 1;
+    plannedMs = 0;
+    bool planned = false;
+    for (int d = d0;; d = std::min(d * 2, d1)) {
+      v.maxIter = d;
+      CoarseStats st;
+      double stageMs = 0;
+      do {
+        st = coarsePass(accum, w, h, v, d, kCoarseBudgetFactor * iterBudget);
+        stageMs += st.kernelMs;
+      } while (!st.complete && probeMs + stageMs < kProbeBudgetMs);
+      probeMs += stageMs;
+      if (!st.complete) break;  // out of probing time: the previous stage stands
+      const double learned = wantsDouble(view) ? rateDouble : rateFloat;
+      const double rate = learned > 0 ? learned : st.work > 0 ? st.work / std::max(probeMs, 1e-3) : 0;
+      auto work = [&](int n) {
+        return 16.0 * (n * st.escapedIters + (double)st.boundary * std::min(d, iterBudget));
+      };
+      auto predict = [&](int n) { return rate > 0 ? work(n) / rate : 0.0; };
+      const double two = predict(2), one = predict(1);
+      if (trace)
+        fprintf(stderr, "probe depth %d: %d hits (%d boundary) of %d points, probe %.2f ms so far, first pass "
+                "predicted %.1f ms with 2 samples\n", d, st.hits, st.boundary, st.points, probeMs, two);
+      if (two <= kFirstPassTargetMs) {
+        bestDepth = d;
+        bestSamples = 2;
+        plannedMs = (float)two;
+        plannedWork = work(2);
+        while (bestSamples * 2 <= total && predict(bestSamples * 2) <= kFirstPassTargetMs) {
+          bestSamples *= 2;
+          plannedMs = (float)predict(bestSamples);
+          plannedWork = work(bestSamples);
+        }
+        planned = true;
+      } else {
+        if (!planned) {  // not even the auto limit with two samples fits: one sample there
+          bestDepth = d;
+          bestSamples = 1;
+          plannedMs = (float)one;
+          plannedWork = work(1);
+          planned = true;
+        }
+        break;  // deeper only costs more
+      }
+      if (d >= d1) break;
+    }
+    iterAdjust = std::max(0, bestDepth - view.maxIter);
+    firstSamples = std::min(bestSamples, total);
+    if (trace)
+      fprintf(stderr, "first pass: limit %d, %d samples, predicted %.1f ms (probe %.2f ms)\n", bestDepth,
+              firstSamples, plannedMs, probeMs);
+  }
+
   // Called with the real time an update took: a slow one (over kSlowFrameMs) cuts the budget
   // of the next passes in proportion, so the next update does not take that long again; fast
   // ones restore it gradually.
@@ -864,6 +942,7 @@ struct Renderer {
     previewIter = (appearanceChanged || previewMag > kPreviewTrust) ? 0 : previewVerified;
     // Geometric changes keep the old image as a prior; appearance changes make its colors stale.
     previewWeight = appearanceChanged ? 0.0f : kPreviewWeight;
+    const bool appearance = appearanceChanged;
     appearanceChanged = false;
     if (dirty) {
       dirty = false;
@@ -879,18 +958,24 @@ struct Renderer {
       // propagates into the new view. A zoom out keeps the chase, which clears the covered
       // area's stale preview colors at the depth they were tested to.
       coarseChase = zoomingOut;
-      const int keep = appearanceChanged ? effectiveIter() : zoomingOut ? 0 : displayUseful;
+      const int keep = appearance ? effectiveIter() : zoomingOut ? 0 : displayUseful;
       if (autoIter) view.maxIter = autoIterations(zoom());
       iterAdjust = std::max(0, std::min(keep, maxIterCap) - view.maxIter);
       ensureOrbits(accum, w, h, totalSamples(view), wantsDouble(view));
       ensureOrbits(accum2, w, h, totalSamples(view), wantsDouble(view));
       clearSamples(accum, w, h);
       firstPassIsFull = true;
+      firstSamples = 2;
+      plannedMs = 0;
+      // A zoom plans its first pass with the coarse field: the depth it starts at (between the
+      // auto limit and the inherited depth) and the samples it takes, to a time budget.
+      if (!appearance) planFirstPass(view.maxIter, std::max(view.maxIter, std::min(keep, maxIterCap)));
     } else {
       shiftSamples(accum, accum2, w, h, pendingShiftX, pendingShiftY);
       std::swap(accum, accum2);
       firstPassIsFull = false;
       coarseChase = true;
+      firstSamples = 2;
     }
     pendingShiftX = pendingShiftY = 0;
     passes = 0;
@@ -902,8 +987,11 @@ struct Renderer {
     shownView = view;
   }
 
-  // True when the first real pass would take long enough that the preview is worth a frame.
-  bool previewWorthShowing() const { return firstPassIsFull && fullPassMs > kPreviewThresholdMs; }
+  // True when the first real pass would take long enough that the preview is worth a frame:
+  // by the plan's prediction when there is one, else by the last full pass's cost.
+  bool previewWorthShowing() const {
+    return firstPassIsFull && (plannedMs > 0 ? plannedMs : fullPassMs) > kPreviewThresholdMs;
+  }
 
   // Moves the view by whole pixels; the accumulation buffer is translated to match.
   void pan(int dx, int dy) {
@@ -938,7 +1026,13 @@ struct Renderer {
         fprintf(stderr, "pass %d limit %d samples %d hits %d rescues %d (deepest escape %d) exposed %d %.3f ms\n",
                 passes, v.maxIter, active, stats.hitCount, stats.rescueCount, stats.maxRescueIter,
                 stats.exposedCount, stats.kernelMs);
-      if (firstPassIsFull) fullPassMs = stats.kernelMs;
+      if (firstPassIsFull) {
+        fullPassMs = stats.kernelMs;
+        // Calibrate the planner's rate with what this first pass really achieved.
+        if (plannedWork > 0 && stats.kernelMs > 0.05f)
+          (stats.usedDouble ? rateDouble : rateFloat) = plannedWork / stats.kernelMs;
+        plannedWork = 0;
+      }
       firstPassIsFull = false;
       ++passes;
       // Depth first, with one sample per pixel: the antialiasing samples start once the

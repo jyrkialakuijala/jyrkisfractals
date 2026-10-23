@@ -325,7 +325,7 @@ __global__ void coarseKernel(typename Vec2<T>::type* __restrict__ orbit, int* __
   T zr = 0, zi = 0, zr2 = 0, zi2 = 0;
   int i = 0;
   const int done = iters[t];
-  if (done == -2) {
+  if (done <= kCoarseEscaped) {
     hit[t] = 0;  // escaped earlier: a deeper limit cannot change that
     return;
   }
@@ -357,8 +357,45 @@ __global__ void coarseKernel(typename Vec2<T>::type* __restrict__ orbit, int* __
     iters[t] = i;  // not escaped so far, taken this deep
     hit[t] = 1;
   } else {
-    iters[t] = -2;  // escaped: never again (a deeper limit cannot change that)
+    iters[t] = kCoarseEscaped - i;  // escaped at iteration i: never again (a deeper limit cannot change that)
     hit[t] = 0;
+  }
+}
+
+// Statistics of the coarse field for planning the first pass of a view (see coarsePass):
+// points that have not escaped, boundary points among them (a neighbouring point escaped),
+// the iterations the escaped points took in all, and the iterations done by every point.
+__device__ unsigned long long d_coarseStats[5];
+__global__ void coarseStatsKernel(const int* __restrict__ iters, const unsigned char* __restrict__ hit, int tw,
+                                  int th, int target) {
+  const int tx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int ty = blockIdx.y * blockDim.y + threadIdx.y;
+  if (tx >= tw || ty >= th) return;
+  const size_t t = (size_t)ty * tw + tx;
+  const int it = iters[t];
+  const bool h = hit[t] != 0;
+  unsigned long long hits = h, boundary = 0, escaped = 0, work = 0, lagging = 0;
+  if (h) {
+    work = it == INT_MAX ? 0 : (unsigned long long)max(it, 0);
+    lagging = it != INT_MAX && it < target;  // not escaped, not yet at the target
+    for (int dy = -1; dy <= 1 && !boundary; ++dy)
+      for (int dx = -1; dx <= 1; ++dx) {
+        const int nx = tx + dx, ny = ty + dy;
+        if (nx < 0 || ny < 0 || nx >= tw || ny >= th) continue;
+        if (!hit[(size_t)ny * tw + nx]) {
+          boundary = 1;
+          break;
+        }
+      }
+  } else if (it <= kCoarseEscaped) {
+    escaped = work = (unsigned long long)(kCoarseEscaped - it);
+  }
+  // One atomic per warp and counter.
+  for (int k = 0; k < 5; ++k) {
+    const unsigned long long v = k == 0 ? hits : k == 1 ? boundary : k == 2 ? escaped : k == 3 ? work : lagging;
+    unsigned long long sum = v;
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+    if ((threadIdx.x & 31) == 0 && sum) atomicAdd(&d_coarseStats[k], sum);
   }
 }
 
@@ -937,6 +974,47 @@ RenderStats renderPass(Accum& accum, int w, int h, const ViewParams& p, const uc
   st.maxRescueIter = counts[2];
   st.exposedCount = counts[3];
   cudaEventElapsedTime(&st.kernelMs, e0, e1);
+  return st;
+}
+
+template <typename T>
+void launchCoarse(Accum& accum, int w, int h, const ViewParams& p, int target, int budget) {
+  dim3 block(32, 8);
+  coarseKernel<T><<<gridFor(accum.tw, accum.th, block), block>>>(
+      (typename Vec2<T>::type*)accum.coarseOrbit, accum.coarseIters, accum.coarseHit, w, h, accum.tw, accum.th,
+      (T)p.centerX, (T)p.centerY, (T)p.scale, target, budget);
+}
+
+CoarseStats coarsePass(Accum& accum, int w, int h, const ViewParams& p, int target, int budget) {
+  CoarseStats st;
+  if (budget <= 0) budget = kCoarseBudgetFactor * kIterBudget;
+  ensureOrbits(accum, w, h, totalSamples(p), wantsDouble(p));
+  static cudaEvent_t e0 = nullptr, e1 = nullptr;
+  if (!e0) {
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+  }
+  unsigned long long zero[5] = {0, 0, 0, 0, 0}, sums[5] = {0, 0, 0, 0, 0};
+  cudaMemcpyToSymbolAsync(d_coarseStats, zero, sizeof zero);
+  cudaEventRecord(e0);
+  if (wantsDouble(p))
+    launchCoarse<double>(accum, w, h, p, target, budget);
+  else
+    launchCoarse<float>(accum, w, h, p, target, budget);
+  cudaEventRecord(e1);
+  dim3 block(32, 8);
+  coarseStatsKernel<<<gridFor(accum.tw, accum.th, block), block>>>(accum.coarseIters, accum.coarseHit, accum.tw,
+                                                                   accum.th, target);
+  cudaError_t err = cudaMemcpyFromSymbol(sums, d_coarseStats, sizeof sums);
+  if (err == cudaSuccess) err = cudaGetLastError();
+  if (err != cudaSuccess) fprintf(stderr, "CUDA error in coarsePass: %s\n", cudaGetErrorString(err));
+  cudaEventElapsedTime(&st.kernelMs, e0, e1);
+  st.points = accum.tw * accum.th;
+  st.hits = (int)sums[0];
+  st.boundary = (int)sums[1];
+  st.escapedIters = (double)sums[2];
+  st.work = (double)sums[3];
+  st.complete = sums[4] == 0;  // no point short of the target that has not escaped
   return st;
 }
 
