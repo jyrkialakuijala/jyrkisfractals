@@ -91,7 +91,10 @@ kernel time.
   Screenshots wait for all samples.
 - Zooming shows a preview first: the last displayed image is resampled with bicubic
   (Catmull-Rom) interpolation into the new view and shown immediately, then real samples
-  replace it pixel by pixel. The preview frame is only spent when a full pass costs more
+  replace it pixel by pixel. Black and non-black areas are resampled separately: the nearest
+  source pixel decides whether a pixel is black, and colors are interpolated from colored
+  taps only, so a magnified black region keeps its boundary instead of a fringe of smeared
+  colors (`docs/preview-trust.md` explains the whole scheme). The preview frame is only spent when a full pass costs more
   than 3 ms, so cheap views still get the real image on the first frame. Every pixel carries
   a weight in its alpha channel: an area nobody has rendered yet has weight 0, resamples to
   weight 0, and adds nothing when real samples arrive, no matter how many zoom events are
@@ -134,10 +137,16 @@ kernel time.
   pure black whatever the preview says, with one exception: the preview remembers the
   depth its colors were tested to (the limit the previous view reached), and where that is
   higher than the current pass's limit and the preview shows color, the pixel is not taken
-  as black: the color stays until the deepening has caught up or a sample escapes (unless the
-  coarse image described below blocks the pixel, which clears it to black). Those
-  colors are trusted through successive zooms until they have been magnified by more than
-  5x in total; beyond that the black areas are computed from scratch. Separately, a zoom in
+  as black: the color stays until the pixel's own samples have reached that depth or one
+  escapes (unless the coarse image described below blocks the pixel, which clears it to
+  black). Only colors of pixels whose samples all escaped, and that have no black neighbour,
+  are trusted that way; the color of a boundary pixel that was part black (some samples hit,
+  or next to black) is a prior but is never held against a hit, since the claim is false for
+  its black part and holding it would fringe every magnified black area with a halo. A black
+  pixel under trusted color also keeps it while it has fewer than its full samples: one hit
+  sample does not refute a whole pixel's mean. Those colors are trusted through successive
+  zooms until they have been magnified by more than 5x in total; beyond that the black
+  areas are computed from scratch. Separately, a zoom in
   starts the new view at the depth the image on screen needed (the limit of the last pass
   that still rescued a noticeable share of the probed pixels, at least 5 or 1% of them, not
   the cap the deepening may chase afterwards), so nothing resets to a shallower limit. A
@@ -165,7 +174,10 @@ kernel time.
   neighbour) one sample at the limit, capped by the per-pass budget; blocked interior pixels
   nothing. The deepest stage that fits 30 ms with the two primary samples sets the starting
   limit (failing that, the auto limit with one sample), and the sample count then doubles,
-  up to the full count, while the prediction still fits. The rate behind the prediction is
+  up to the full count, while the prediction still fits. A zoom in may start up to four
+  times deeper than the depth the previous image needed, never deeper than it verified, so
+  boundary pixels that need a little more depth catch up through the per-pass budget in a
+  few passes instead of 500 iterations per pass. The rate behind the prediction is
   what the last first pass really achieved in that precision, learned from its measured
   time, so predictions settle within a few percent after the first zoom (the probe's own
   rate, which runs far fewer threads, stands in before that and errs on the slow side). The
@@ -214,7 +226,13 @@ kernel time.
   surround fill is approximate, so up to 0.5% of its pixels may (a pixel colored in the
   surround at 1000 iterations can hit a deeper limit and be rescued deeper still).
   `JF_FLICKER_DUMP=1` lists some of the offending pixels, `JF_FLICKER_PIXEL="x y"` traces one
-  through the first passes.
+  through the first passes. Mixed and shallow pixels that go black are reported with how long
+  they stayed black, not judged: black and color are kept separate on purpose.
+- Nothing haloes either. `--test-halo F N` (use `--size 3840x2160`, where the effect was
+  first seen) converges a view, zooms in N times quickly with one pass between zooms, then
+  watches every frame of the final view: a pixel that is black by rule at the end and not
+  adjacent to color must never have shown color in a rendered frame. The preview frame
+  itself is reported, not judged, and the one-pixel band next to color is tolerated.
 - Panning reuses work. The accumulation buffer stores a per-pixel sample count, drags are
   snapped to whole pixels, and a pan translates the buffer on the GPU so only the newly
   exposed strip needs computing; pixels still on screen keep all their samples.

@@ -64,4 +64,6 @@ only changes how black mixes into a pixel that has color.
 
 It is not the "deeper preview" rule, which keeps a magnified previous image's
 color for a pixel whose own samples are all black. That compares the pixel to
-another image; this compares a pixel's samples to each other.
+another image (see `preview-trust.md`); this compares a pixel's samples to each
+other. The two share `Accum::depth`: the preview rule compares its depth with
+the depth the pixel's samples reached, not with the pass limit.

@@ -104,6 +104,11 @@ const int kMinIterBudget = 64;
 // to stay within this predicted time.
 const double kProbeBudgetMs = 10.0;
 const double kFirstPassTargetMs = 30.0;
+// A zoom in may start up to this many times deeper than the depth the previous image needed
+// (never deeper than it verified): boundary pixels that need a little more depth then catch up
+// through the per-pass budget in a few passes instead of 500 iterations per pass, so they
+// are black for fewer frames, while the truly black ones are not chased towards the cap.
+const int kDepthHeadroom = 4;
 
 struct Options {
   int width = 1280, height = 800;
@@ -120,6 +125,8 @@ struct Options {
   int shiftDx = 0, shiftDy = 0;
   bool zoomTest = false;    // headless: verify the zoom preview
   bool flickerTest = false; // headless: verify that no black appears temporarily while a zoom renders
+  bool haloTest = false;    // headless: verify that quick zooms leave no temporary color inside black areas
+  int haloSteps = 4;
   double zoomFactor = 2.0;
   ViewParams view;
   bool viewGiven = false;
@@ -144,6 +151,8 @@ void usage() {
       "  --test-zoom F DX DY headless: verify the zoom preview (factor F, offset DX DY source pixels)\n"
       "  --test-flicker F   headless: zoom by F (F < 1: out) as the GUI does and verify that no pixel the\n"
       "                     preview showed colored turns black in between\n"
+      "  --test-halo F N    headless: zoom in by F N times quickly (one pass between zooms) and verify that\n"
+      "                     no pixel that is black at the end showed color in between (halos in black areas)\n"
       "  --save-on-exit F.png with --exit-after: write the converged view before quitting\n"
       "  --test-deeper      headless: verify that a preview computed deeper keeps limit-hit pixels colored\n"
       "  --test-resume      headless: verify that deepening with resumed orbits matches a fresh render\n"
@@ -232,6 +241,11 @@ Options parseArgs(int argc, char** argv) {
       need(1);
       o.flickerTest = true;
       o.zoomFactor = atof(argv[++i]);
+    } else if (a == "--test-halo") {
+      need(2);
+      o.haloTest = true;
+      o.zoomFactor = atof(argv[++i]);
+      o.haloSteps = atoi(argv[++i]);
     } else if (a == "--test-zoom") {
       need(3);
       o.zoomTest = true;
@@ -419,7 +433,9 @@ int testDeeper(Accum accum, uchar4* dev, uchar4* dev2, int w, int h, ViewParams 
   size_t colored = 0, blackWith = 0, blackWithout = 0, kept = 0, certain = 0, certainWrong = 0, coarse = 0,
          coarseWrong = 0;
   for (size_t i = 0; i < bytes; i += 4) {
-    if (preview[i + 3] == 0 || (preview[i] | preview[i + 1] | preview[i + 2]) == 0) continue;
+    // Only the preview's trusted colors (every sample escaped) are held; mixed boundary pixels
+    // (some samples hit) are a prior only.
+    if (preview[i + 3] != kPreviewAlphaTrusted || (preview[i] | preview[i + 1] | preview[i + 2]) == 0) continue;
     ++colored;
     const bool bw = (with[i] | with[i + 1] | with[i + 2]) == 0;
     const bool bo = (without[i] | without[i + 1] | without[i + 2]) == 0;
@@ -618,10 +634,12 @@ int testZoom(Accum accum, uchar4* dev, uchar4* dev2, int w, int h, ViewParams a,
 // ---------------------------------------------------------------- headless --
 
 int testFlicker(const Options& o, double factor);
+int testHalo(const Options& o, double factor, int steps);
 
 int runHeadless(const Options& o) {
   CUDA_CHECK(cudaSetDevice(0));
   if (o.flickerTest) return testFlicker(o, o.zoomFactor);
+  if (o.haloTest) return testHalo(o, o.zoomFactor, o.haloSteps);
   ViewParams v = o.view;
   if (!o.iterGiven) v.maxIter = autoIterations(defaultScale(o.width) / v.scale);
   const int w = o.width, h = o.height;
@@ -959,6 +977,11 @@ struct Renderer {
       // area's stale preview colors at the depth they were tested to.
       coarseChase = zoomingOut;
       const int keep = appearance ? effectiveIter() : zoomingOut ? 0 : displayUseful;
+      // The planner may go beyond the useful depth, with headroom, if the previous image
+      // verified that deep and the time budget allows.
+      const int reach = appearance || zoomingOut
+                            ? keep
+                            : std::min(displayVerified, (int)std::min<long long>(4LL * kDepthHeadroom * displayUseful / 4, maxIterCap));
       if (autoIter) view.maxIter = autoIterations(zoom());
       iterAdjust = std::max(0, std::min(keep, maxIterCap) - view.maxIter);
       ensureOrbits(accum, w, h, totalSamples(view), wantsDouble(view));
@@ -969,7 +992,7 @@ struct Renderer {
       plannedMs = 0;
       // A zoom plans its first pass with the coarse field: the depth it starts at (between the
       // auto limit and the inherited depth) and the samples it takes, to a time budget.
-      if (!appearance) planFirstPass(view.maxIter, std::max(view.maxIter, std::min(keep, maxIterCap)));
+      if (!appearance) planFirstPass(view.maxIter, std::max(view.maxIter, std::min(reach, maxIterCap)));
     } else {
       shiftSamples(accum, accum2, w, h, pendingShiftX, pendingShiftY);
       std::swap(accum, accum2);
@@ -1394,6 +1417,7 @@ int testFlicker(const Options& o, double factor) {
   grab(prior);  // the preview frame: what the screen shows right after the zoom
   const float surroundMs = r.surroundMs;
   std::vector<int> firstBlack(n, 0);  // pass at which the pixel first showed black (0: never)
+  std::vector<int> blackFrames(n, 0);  // how many frames the pixel showed black by rule
   std::vector<float> passWeights;
   std::vector<unsigned short> passMeta;
   int passesB = 0;
@@ -1408,7 +1432,10 @@ int testFlicker(const Options& o, double factor) {
     // samples can round to zero too, and that is no flash.
     readCounts(r.accum, r.w, r.h, passWeights, passMeta);
     for (size_t i = 0; i < n; ++i)
-      if (!firstBlack[i] && !colored(frame, i) && showsBlack(passMeta[i])) firstBlack[i] = passesB;
+      if (!colored(frame, i) && showsBlack(passMeta[i])) {
+        if (!firstBlack[i]) firstBlack[i] = passesB;
+        ++blackFrames[i];
+      }
     if (px >= 0 && passesB <= 16) {
       std::vector<float> wts;
       std::vector<unsigned short> mt;
@@ -1422,7 +1449,8 @@ int testFlicker(const Options& o, double factor) {
               isCoarseBlack(mt[i]) ? " coarse" : "", r.previewIter);
     }
   } while (!r.done());
-  size_t trusted = 0, shallow = 0, trustedEnd = 0, shallowEnd = 0, trustedFlash = 0, shallowFlash = 0;
+  size_t trusted = 0, shallow = 0, trustedEnd = 0, shallowEnd = 0, trustedFlash = 0, shallowFlash = 0,
+         shallowBlackFrames = 0;
   std::vector<size_t> flashAt(passesB + 1, 0);
   const bool dump = getenv("JF_FLICKER_DUMP") != nullptr;  // print some of the flashing pixels
   int dumped = 0;
@@ -1432,12 +1460,13 @@ int testFlicker(const Options& o, double factor) {
   for (size_t i = 0; i < n; ++i) {
     const uint8_t a = prior[4 * i + 3];
     if (a == 0 || !colored(prior, i)) continue;
-    const bool isTrusted = a == kPreviewAlphaTrusted;
+    const bool isTrusted = a == kPreviewAlphaTrusted;  // else shallow surround or mixed boundary color
     (isTrusted ? trusted : shallow)++;
     if (!colored(frame, i)) {
       (isTrusted ? trustedEnd : shallowEnd)++;  // black for good: fine
     } else if (firstBlack[i]) {
       (isTrusted ? trustedFlash : shallowFlash)++;
+      if (!isTrusted) shallowBlackFrames += blackFrames[i];
       flashAt[firstBlack[i]]++;
       if (dump && dumped < 30) {
         ++dumped;
@@ -1452,12 +1481,125 @@ int testFlicker(const Options& o, double factor) {
   int worstPass = 0;
   for (int k = 1; k <= passesB; ++k)
     if (flashAt[k] > flashAt[worstPass]) worstPass = k;
-  const bool ok = trustedFlash == 0 && shallowFlash <= shallow / 200 && passesB > 1 && (factor >= 1 || shallow > 0);
+  // Trusted colors must never flash. Boundary pixels (mixed color: the previous view's pixel
+  // was part black) and the shallow surround fill are approximate: a pixel there whose own
+  // sample hits is black until the sample escapes deeper, which is right by the rule that
+  // black and color stay separate; they are reported with how long they stayed black.
+  const double meanBlack = shallowFlash ? (double)shallowBlackFrames / shallowFlash : 0.0;
+  const bool ok = trustedFlash == 0 && passesB > 1 && (factor >= 1 || shallow > 0);
   printf("flicker test (zoom x%g, %d passes before, %d after, surround %.3f ms): %zu pixels with trusted preview "
-         "color (%zu black for good, %zu black in between), %zu with shallow surround color (%zu black for good, "
-         "%zu black in between, most first at pass %d) -> %s\n",
+         "color (%zu black for good, %zu black in between), %zu with shallow or mixed color (%zu black for good, "
+         "%zu black in between for %.1f frames on average, most first at pass %d) -> %s\n",
          factor, passesA, passesB, surroundMs, trusted, trustedEnd, trustedFlash, shallow, shallowEnd, shallowFlash,
-         worstPass, ok ? "OK" : "FAIL");
+         meanBlack, worstPass, ok ? "OK" : "FAIL");
+  r.freeFrame();
+  return ok ? 0 : 1;
+}
+
+// Self-test for halos in black areas: converges a view, zooms in by `factor` `steps` times
+// quickly (one pass between zooms, as when the wheel is spun), then watches every frame of the
+// final view until it has converged. The black and the non-black areas must stay separate: a
+// pixel that is black by rule at the end (all samples hit, or blocked by the coarse image)
+// must not have shown color in any frame before, which is what a magnified preview smearing
+// boundary colors into the interior would do. A one-pixel band is tolerated: a pixel of the
+// final view inside black may map to a boundary pixel of the earlier, coarser view whose
+// mean was colored; beyond that band the halo is counted.
+int testHalo(const Options& o, double factor, int steps) {
+  Renderer r;
+  r.w = o.width;
+  r.h = o.height;
+  r.view = o.view;
+  r.autoIter = !o.iterGiven;
+  r.maxIterCap = kFlickerTestCap;
+  r.allocFrame();
+  const size_t n = (size_t)r.w * r.h, bytes = n * 4;
+  std::vector<uint8_t> frame(bytes);
+  auto grab = [&]() {
+    r.resolveDisplay();
+    CUDA_CHECK(cudaMemcpy(frame.data(), r.display, bytes, cudaMemcpyDeviceToHost));
+  };
+  r.applyChanges();
+  int passesA = 0;
+  do {
+    r.renderPasses(0);
+    ++passesA;
+  } while (!r.done());
+  grab();
+  // Quick zooms: one pass each, then the final view is watched from its preview frame on.
+  std::vector<int> lastColored(n, -1);  // frame index at which the pixel last showed color (-1: never)
+  std::vector<size_t> coloredAt;        // per frame: pixels colored that end up black (filled at the end)
+  std::vector<std::vector<uint8_t>> history;  // frames of the final view (preview frame first)
+  for (int s = 0; s < steps; ++s) {
+    r.zoomAt(0.5 * r.w, 0.5 * r.h, factor);
+    r.applyChanges();
+    grab();
+    if (s == steps - 1) history.push_back(frame);
+    if (s < steps - 1) r.renderPasses(0);
+  }
+  int passesB = 0;
+  do {
+    r.renderPasses(0);
+    ++passesB;
+    grab();
+    history.push_back(frame);
+  } while (!r.done());
+  std::vector<float> weights;
+  std::vector<unsigned short> meta;
+  readCounts(r.accum, r.w, r.h, weights, meta);
+  // Final black by rule, and more than a pixel away from any final non-black pixel.
+  std::vector<uint8_t> black(n, 0), deep(n, 0);
+  size_t blackCount = 0, deepCount = 0;
+  for (size_t i = 0; i < n; ++i) black[i] = showsBlack(meta[i]), blackCount += black[i];
+  for (int y = 0; y < r.h; ++y)
+    for (int x = 0; x < r.w; ++x) {
+      const size_t i = (size_t)y * r.w + x;
+      if (!black[i]) continue;
+      bool inside = true;
+      for (int dy = -1; dy <= 1 && inside; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= r.w || ny >= r.h) continue;
+          if (!black[(size_t)ny * r.w + nx]) {
+            inside = false;
+            break;
+          }
+        }
+      deep[i] = inside;
+      deepCount += inside;
+    }
+  // Frame 0 is the preview itself (the previous image magnified, shown before any sample):
+  // what it shows inside the final black is reported but not judged; the frames with samples
+  // are.
+  size_t halo = 0, haloBand = 0, worst = 0, inPreview = 0;
+  int worstFrame = 0, lastFrame = -1;
+  for (size_t f = 0; f < history.size(); ++f) {
+    const std::vector<uint8_t>& img = history[f];
+    size_t count = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (!black[i] || (img[4 * i] | img[4 * i + 1] | img[4 * i + 2]) == 0) continue;
+      if (f == 0) {
+        inPreview += deep[i];
+        continue;
+      }
+      if (deep[i]) {
+        ++count;
+        if (lastColored[i] < 0) ++halo;
+        lastColored[i] = (int)f;
+        lastFrame = (int)f;
+      } else if (lastColored[i] < 0) {
+        ++haloBand;
+        lastColored[i] = (int)f;
+      }
+    }
+    if (count > worst) worst = count, worstFrame = (int)f;
+  }
+  const bool ok = halo == 0 && passesB > 1 && deepCount > 0;
+  printf("halo test (%d quick zooms of x%g at %dx%d, %d passes before, %d after): %zu pixels black at the end, %zu "
+         "of them inside (not next to color); %zu of those colored in the preview frame; colored in a rendered "
+         "frame: %zu inside (halo; worst frame %d with %zu, last in frame %d of %zu), %zu in the boundary band "
+         "(tolerated) -> %s\n",
+         steps, factor, r.w, r.h, passesA, passesB, blackCount, deepCount, inPreview, halo, worstFrame, worst,
+         lastFrame, history.size(), haloBand, ok ? "OK" : "FAIL");
   r.freeFrame();
   return ok ? 0 : 1;
 }
@@ -1589,7 +1731,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (!o.headlessOut.empty() || o.benchFrames > 0 || o.shiftTest || o.zoomTest || o.deeperTest || o.resumeTest ||
-      o.recolorTest || o.flickerTest)
+      o.recolorTest || o.flickerTest || o.haloTest)
     return runHeadless(o);
   return runGui(o);
 }

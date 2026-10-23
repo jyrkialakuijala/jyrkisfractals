@@ -133,11 +133,16 @@ struct CoarseStats {
 
 // The alpha channel of a preview / display pixel is its weight (0: nothing rendered there) and
 // says how far its colors are trusted: kPreviewAlphaTrusted marks colors tested to the previous
-// view's depth (previewIter), kPreviewAlphaShallow colors from the low-iteration surround image
-// that fills in the border of a zoom out (tested only to shallowIter). Resampling keeps these
-// classes where an area is fully covered and lowers alpha where it is mixed with nothing.
+// view's depth (previewIter): every sample of the pixel escaped. kPreviewAlphaShallow marks
+// colors from the low-iteration surround image that fills in the border of a zoom out (tested
+// only to shallowIter). kPreviewAlphaMixed marks the color of a pixel some of whose samples hit
+// the limit: a boundary pixel, part black. Its color is a prior like the others, but it is not
+// held against a hit after a zoom, since the claim "color to that depth" is false for its black
+// part (holding it would fringe every magnified black area with a halo). Resampling keeps
+// these classes where an area is fully covered and lowers alpha where it is mixed with nothing.
 constexpr int kPreviewAlphaTrusted = 255;
 constexpr int kPreviewAlphaShallow = 254;
+constexpr int kPreviewAlphaMixed = 253;
 // Depths a preview's colors were tested to, by alpha class (0: no preview / not trusted).
 struct PreviewTrust {
   int deep;     // for kPreviewAlphaTrusted pixels

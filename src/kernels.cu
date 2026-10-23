@@ -128,9 +128,21 @@ __device__ __forceinline__ bool previewDeeperAndColored(const uchar4* preview, s
   return previewDepthAt(p, t) > limit && (p.x | p.y | p.z) != 0;
 }
 
-__global__ void blackTilesKernel(const unsigned short* __restrict__ meta, const uchar4* __restrict__ preview,
-                                 PreviewTrust trust, int limit, unsigned char* __restrict__ tiles, int w, int h,
-                                 int tw, int th) {
+// True when the preview's color stands in for a black pixel: computed deeper than the pixel's
+// samples reached (above), or trusted (every sample of the previous view's pixel escaped) while
+// this pixel has fewer than its full samples: one hit sample cannot refute a full pixel's mean,
+// the pixel is a boundary sliver at best, and its antialiasing samples settle it.
+__device__ __forceinline__ bool previewHolds(const uchar4* preview, size_t idx, PreviewTrust t, int depth, int taken,
+                                             int total) {
+  if (!preview) return false;
+  const uchar4 p = preview[idx];
+  if ((p.x | p.y | p.z) == 0) return false;
+  return previewDepthAt(p, t) > depth || (p.w == kPreviewAlphaTrusted && t.deep > 0 && taken < total);
+}
+
+__global__ void blackTilesKernel(const unsigned short* __restrict__ meta, const int* __restrict__ depth,
+                                 const uchar4* __restrict__ preview, PreviewTrust trust, int total,
+                                 unsigned char* __restrict__ tiles, int w, int h, int tw, int th) {
   const int tx = blockIdx.x * blockDim.x + threadIdx.x;
   const int ty = blockIdx.y * blockDim.y + threadIdx.y;
   if (tx >= tw || ty >= th) return;
@@ -140,7 +152,8 @@ __global__ void blackTilesKernel(const unsigned short* __restrict__ meta, const 
       const size_t idx = (size_t)y * w + x;
       const unsigned short m = meta[idx];
       black += showsBlack(m) &&
-               (isCertain(m) || isCoarseBlack(m) || !previewDeeperAndColored(preview, idx, trust, limit));
+               (isCertain(m) || isCoarseBlack(m) ||
+                !previewHolds(preview, idx, trust, depth[idx], samplesTaken(m), total));
     }
   tiles[(size_t)ty * tw + tx] = (unsigned char)black;
 }
@@ -429,9 +442,12 @@ mandelbrotKernel(float4* __restrict__ accum, unsigned short* __restrict__ meta,
   // coarse points taken at least that deep can block it; blocked, it is cleared to black
   // whatever interpolated color the earlier rendering left there (see resolveKernel).
   if (coarseHit && (taken == 0 || isBlack(m))) {
-    const int depth =
-        previewDeeperAndColored(preview, idx, trust, maxIter) ? previewDepthAt(preview[idx], trust) : maxIter;
-    if (coarseInterior(coarseHit, coarseIters, x, y, tw, th, depth)) {
+    // The pixel's claim: the preview's depth where it shows a trusted color deeper than the
+    // pixel's own samples reached, else the pass's limit.
+    const int claim = previewHolds(preview, idx, trust, depth[idx], taken, totalSamples)
+                          ? max(previewDepthAt(preview[idx], trust), maxIter)
+                          : maxIter;
+    if (coarseInterior(coarseHit, coarseIters, x, y, tw, th, claim)) {
       if (!isCoarseBlack(m)) meta[idx] = (unsigned short)(m | 0x8000);
       return;
     }
@@ -464,7 +480,8 @@ mandelbrotKernel(float4* __restrict__ accum, unsigned short* __restrict__ meta,
   // color, though: that band along the previous view's boundary is probed deeper every time.
   if (isBlack(m) && tiles &&
       (isCertain(m) ||
-       (!previewDeeperAndColored(preview, idx, trust, maxIter) && !previewColorNearby(previewTiles, x, y, tw, th))) &&
+       (!previewHolds(preview, idx, trust, depth[idx], taken, totalSamples) &&
+        !previewColorNearby(previewTiles, x, y, tw, th))) &&
       deepInBlack(tiles, x, y, w, h, tw, th))
     return;
   bool anyHit = false, exposed = false;
@@ -569,8 +586,10 @@ __global__ void recolorKernel(float4* __restrict__ accum, const unsigned short* 
 }
 
 __global__ void resolveKernel(const float4* __restrict__ accum, const unsigned short* __restrict__ meta,
-                              const uchar4* __restrict__ preview, float previewWeight, PreviewTrust trust,
-                              int limit, uchar4* __restrict__ out, int n) {
+                              const int* __restrict__ depth, const uchar4* __restrict__ preview,
+                              float previewWeight, PreviewTrust trust, int total, uchar4* __restrict__ out, int w,
+                              int h) {
+  const int n = w * h;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   float4 a = accum[i];
@@ -583,7 +602,9 @@ __global__ void resolveKernel(const float4* __restrict__ accum, const unsigned s
   // better estimate until they are in. A pixel blocked by the coarse 4x4 image is pure black
   // whatever the preview says: no interpolated halo of an earlier rendering survives there.
   if (showsBlack(m)) {
-    if (!isCoarseBlack(m) && previewDeeperAndColored(preview, i, trust, limit)) {
+    // Deeper than what this pixel's own samples have reached (not the pass's limit: with a
+    // deep start the samples catch up over several budgeted passes).
+    if (!isCoarseBlack(m) && previewHolds(preview, i, trust, depth[i], samplesTaken(m), total)) {
       uchar4 p = preview[i];
       p.w = 255;
       out[i] = p;
@@ -593,6 +614,24 @@ __global__ void resolveKernel(const float4* __restrict__ accum, const unsigned s
     return;
   }
   const float cnt = a.w;  // total weight of the aged samples
+  // The pixel's own alpha class once it has samples: trusted when every sample escaped and no
+  // neighbour is black, mixed when some sample hit or a neighbour is black: such a boundary
+  // pixel may cover a sliver of black its samples missed, and its color must not be held
+  // against hits after a zoom any more than a part-black pixel's.
+  bool nextToBlack = false;
+  if (limitHits(m) == 0) {
+    const int x = i % w, y = i / w;
+    for (int dy = -1; dy <= 1 && !nextToBlack; ++dy)
+      for (int dx = -1; dx <= 1; ++dx) {
+        const int nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        if (showsBlack(meta[(size_t)ny * w + nx])) {
+          nextToBlack = true;
+          break;
+        }
+      }
+  }
+  const unsigned char own = limitHits(m) > 0 || nextToBlack ? kPreviewAlphaMixed : kPreviewAlphaTrusted;
   uchar4 p = preview ? preview[i] : make_uchar4(0, 0, 0, 0);
   // The output alpha is the pixel's confidence: 255 once it has real samples, otherwise the
   // preview's own alpha. A pixel nobody has rendered stays at alpha 0, so that when it is
@@ -600,7 +639,7 @@ __global__ void resolveKernel(const float4* __restrict__ accum, const unsigned s
   if (p.w == 0) {
     // No usable preview here: plain average of the real samples (black at count 0).
     float inv = cnt > 0 ? 1.0f / cnt : 0.0f;
-    out[i] = make_uchar4(toByte(a.x * inv), toByte(a.y * inv), toByte(a.z * inv), cnt > 0 ? 255 : 0);
+    out[i] = make_uchar4(toByte(a.x * inv), toByte(a.y * inv), toByte(a.z * inv), cnt > 0 ? own : 0);
     return;
   }
   // The preview stands in for previewWeight samples, scaled by its alpha; until real samples
@@ -609,7 +648,7 @@ __global__ void resolveKernel(const float4* __restrict__ accum, const unsigned s
   const float inv = 1.0f / (wp + cnt);
   const float s = wp / 255.0f;
   out[i] = make_uchar4(toByte((a.x + s * p.x) * inv), toByte((a.y + s * p.y) * inv), toByte((a.z + s * p.z) * inv),
-                       cnt > 0 ? 255 : p.w);
+                       cnt > 0 ? own : p.w);
 }
 
 // Catmull-Rom cubic weight for a tap at distance t from the sample point.
@@ -623,9 +662,14 @@ __device__ __forceinline__ float cubicWeight(float t) {
 // dst(x, y) = bicubic sample of src at (r*x + bx, r*y + by), the position of this pixel's
 // center in the source image.
 // Resamples `src` (sw x sh) into `dst` (w x h): dst pixel (x, y) reads src at (r x + bx, r y + by).
-// With `fillOnly`, only dst pixels of alpha 0 (nothing there yet) are written, and the result's
-// alpha is capped at kPreviewAlphaShallow: the fill is a prior, but its colors are only trusted
-// to the shallow depth (see fillPreview).
+// Black and non-black areas are kept separate: the nearest source pixel decides whether the
+// result is black (a rendered pixel with no color), and the color of a non-black result is
+// interpolated from the non-black taps only. So a magnified black region keeps its boundary
+// instead of being fringed with smeared boundary colors (which the trusted-preview rule would
+// then hold as a halo until the deepening caught up), and the boundary colors are not darkened
+// by black taps either. With `fillOnly`, only dst pixels of alpha 0 (nothing there yet) are
+// written, and the result's alpha is capped at kPreviewAlphaShallow: the fill is a prior, but
+// its colors are only trusted to the shallow depth (see fillPreview).
 __global__ void resampleKernel(const uchar4* __restrict__ src, int sw, int sh, uchar4* __restrict__ dst, int w,
                                int h, float r, float bx, float by, bool fillOnly) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -639,26 +683,39 @@ __global__ void resampleKernel(const uchar4* __restrict__ src, int sw, int sh, u
     const float fx = px - ix, fy = py - iy;
     float wx[4] = {cubicWeight(fx + 1), cubicWeight(fx), cubicWeight(1 - fx), cubicWeight(2 - fx)};
     float wy[4] = {cubicWeight(fy + 1), cubicWeight(fy), cubicWeight(1 - fy), cubicWeight(2 - fy)};
+    // The class of the nearest source pixel: black (rendered, no color) or not.
+    const int nx = min(max((int)floorf(px + 0.5f), 0), sw - 1), ny = min(max((int)floorf(py + 0.5f), 0), sh - 1);
+    const uchar4 nearest = src[(size_t)ny * sw + nx];
+    const bool blackHere = nearest.w != 0 && (nearest.x | nearest.y | nearest.z) == 0;
     // Alpha-weighted taps: source pixels with alpha 0 were never rendered and must not pull
     // the result toward black. The output alpha is the resampled alpha, so unrendered areas
-    // stay at weight 0 through any number of successive zooms.
+    // stay at weight 0 through any number of successive zooms. Taps of the other class are
+    // left out of the color (their weight still counts towards the alpha).
     float3 sum = make_float3(0, 0, 0);
-    float wa = 0;
+    float wa = 0, wc = 0;
     for (int j = 0; j < 4; ++j) {
       const int sy = min(max(iy - 1 + j, 0), sh - 1);
       for (int i = 0; i < 4; ++i) {
         const int sx = min(max(ix - 1 + i, 0), sw - 1);
         const uchar4 c = src[(size_t)sy * sw + sx];
         const float wgt = wx[i] * wy[j] * c.w;
+        wa += wgt;
+        const bool black = c.w != 0 && (c.x | c.y | c.z) == 0;
+        if (black != blackHere) continue;
         sum.x += wgt * c.x;
         sum.y += wgt * c.y;
         sum.z += wgt * c.z;
-        wa += wgt;
+        wc += wgt;
       }
     }
     if (wa > 0.0f) {
-      const float inv = 1.0f / (wa * 255.0f);
-      result = make_uchar4(toByte(sum.x * inv), toByte(sum.y * inv), toByte(sum.z * inv), toByte(wa / 255.0f));
+      const float inv = wc > 0.0f ? 1.0f / (wc * 255.0f) : 0.0f;
+      // The alpha is the resampled weight where the area is only partly rendered; where it is
+      // fully covered it is the nearest source pixel's class (trusted, shallow or mixed), so
+      // the classes do not blur into each other (averaging 255 and 253 would read as 254).
+      const unsigned char alpha = wa >= 0.99f * 255.0f && nearest.w != 0 ? nearest.w : toByte(wa / 255.0f);
+      result = make_uchar4(toByte(sum.x * inv), toByte(sum.y * inv), toByte(sum.z * inv), alpha);
+      if (blackHere) result.x = result.y = result.z = 0;
       if (fillOnly) result.w = min(result.w, (unsigned char)kPreviewAlphaShallow);
     }
   }
@@ -784,8 +841,8 @@ bool g_tileSkip = true;
 
 // Device buffers for the per-tile black counts and preview-color flags, grown as needed.
 // Returns false (and null tiles) when the skip rule is off or memory is short.
-bool tileMaps(const unsigned short* meta, const uchar4* preview, PreviewTrust trust, int limit, int w, int h,
-              int& tw, int& th, unsigned char*& blackOut, unsigned char*& previewOut) {
+bool tileMaps(const unsigned short* meta, const int* depth, const uchar4* preview, PreviewTrust trust, int limit,
+              int total, int w, int h, int& tw, int& th, unsigned char*& blackOut, unsigned char*& previewOut) {
   static unsigned char* tiles = nullptr;
   static unsigned char* previewTiles = nullptr;
   static size_t capacity = 0;
@@ -806,7 +863,7 @@ bool tileMaps(const unsigned short* meta, const uchar4* preview, PreviewTrust tr
     capacity = need;
   }
   dim3 block(32, 8);
-  blackTilesKernel<<<gridFor(tw, th, block), block>>>(meta, preview, trust, limit, tiles, w, h, tw, th);
+  blackTilesKernel<<<gridFor(tw, th, block), block>>>(meta, depth, preview, trust, total, tiles, w, h, tw, th);
   blackOut = tiles;
   if (preview && max(trust.deep, trust.shallow) > limit) {
     previewTilesKernel<<<gridFor(tw, th, block), block>>>(preview, trust, limit, previewTiles, w, h, tw, th);
@@ -931,7 +988,7 @@ RenderStats renderPass(Accum& accum, int w, int h, const ViewParams& p, const uc
   cudaEventRecord(e0);
   int tw = 0, th = 0;
   unsigned char *tiles = nullptr, *previewTiles = nullptr;
-  tileMaps(accum.meta, preview, trust, p.maxIter, w, h, tw, th, tiles, previewTiles);
+  tileMaps(accum.meta, accum.depth, preview, trust, p.maxIter, total, w, h, tw, th, tiles, previewTiles);
   if (st.usedDouble)
     launch<double>(accum, tiles, previewTiles, preview, trust, w, h, tw, th, p, total, activeSamples, earlyAA,
                    settledIter, iterBudget, coarseChase);
@@ -1029,8 +1086,9 @@ void resolveSamples(Accum accum, const uchar4* preview, float previewWeight, uch
                     int previewIter, int sampleIter, int shallowIter) {
   int n = w * h;
   const PreviewTrust trust = {preview ? previewIter : 0, preview ? shallowIter : 0};
-  resolveKernel<<<(n + 255) / 256, 256>>>(accum.color, accum.meta, preview, previewWeight, trust, sampleIter, out,
-                                          n);
+  (void)sampleIter;  // the comparison is per pixel, against the depth its samples reached
+  resolveKernel<<<(n + 255) / 256, 256>>>(accum.color, accum.meta, accum.depth, preview, previewWeight, trust,
+                                          accum.orbitSlots, out, w, h);
 }
 
 static void resample(const uchar4* src, int sw, int sh, const ViewParams& from, uchar4* dst, int w, int h,
